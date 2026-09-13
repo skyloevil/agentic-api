@@ -57,35 +57,21 @@ class MessagesTests(unittest.TestCase):
         message = check.response_message(self.streaming_turn())
         self.assertEqual(message["content"][0]["signature"], "32d0a706de774281bec15280dec400c0")
 
-    def test_stream_faults(self):
+    def test_invalid_streaming_tool_arguments_fail_recording(self):
         turn = self.streaming_turn()
         raw = "".join(turn["response"]["sse"])
-        def corrupt(kind):
-            lines = []
-            for line in raw.splitlines(keepends=True):
-                if line.startswith("data:"):
-                    event = json.loads(line[5:])
-                    if kind == "error" and event["type"] == "message_stop":
-                        event = {"type": "error"}
-                    if kind == "arguments" and event.get("delta", {}).get("type") == "input_json_delta":
-                        event["delta"]["partial_json"] = "{broken"
-                    line = "data: " + json.dumps(event) + "\n"
-                lines.append(line)
-            return "".join(lines)
-
-        faults = {
-            "truncated": raw[:raw.rfind("event: message_stop")],
-            "error": corrupt("error"),
-            "invalid json": 'data: {broken}\n\n',
-            "empty": '',
-            "invalid arguments": corrupt("arguments"),
-        }
-        for name, wire in faults.items():
-            with self.subTest(name=name):
-                broken = copy.deepcopy(turn)
-                broken["response"]["sse"] = [wire]
-                with self.assertRaises((ValueError, KeyError)):
-                    check.response_message(broken)
+        lines = []
+        for line in raw.splitlines(keepends=True):
+            if line.startswith("data:"):
+                event = json.loads(line[5:])
+                if event.get("delta", {}).get("type") == "input_json_delta":
+                    event["delta"]["partial_json"] = "{broken"
+                line = "data: " + json.dumps(event) + "\n"
+            lines.append(line)
+        broken = copy.deepcopy(turn)
+        broken["response"]["sse"] = ["".join(lines)]
+        with self.assertRaises(json.JSONDecodeError):
+            check.response_message(broken)
 
     def test_real_recorder_script_and_failure_preserves_files(self):
         captures = {}

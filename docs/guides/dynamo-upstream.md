@@ -199,8 +199,8 @@ output matches `messages/tool_outputs.json`. No external search service, subscri
 
 The existing streaming vLLM fixture predates recorder support for `signature_delta`: its captured response contains a
 signature that its next request omitted. The preparation test derives that one legacy expectation from the captured
-wire event. Dynamo acceptance has no such exception. New recordings preserve signatures and reject malformed tool
-argument JSON, missing stream completion, and upstream error events instead of silently repairing them.
+wire event. Dynamo acceptance has no such exception. New recordings preserve signatures, and malformed tool argument
+JSON fails recording instead of being silently replaced with an empty object.
 
 ### Prepare one RunPod Pod
 
