@@ -19,7 +19,7 @@ for mode in nonstreaming streaming; do
         --mode messages --turns 2 "$flag" --vllm "$url" --model "$model" \
         --tools "$here/messages/tools.json" --tool-outputs "$here/messages/tool_outputs.json" \
         --max-output-tokens 2048 --proxy-port "${PROXY_PORT:-7070}" --output "$file"
-    "$python" "$root/scripts/dynamo/validate_messages.py" "$file" "$model"
+    "$python" "$here/validate_messages.py" "$file" "$model"
 done
 "$python" "$root/scripts/validate-cassettes.py" "$stage"
 for mode in nonstreaming streaming; do

@@ -9,8 +9,7 @@ import sys
 import httpx
 import yaml
 
-ROOT = Path(__file__).resolve().parents[2]
-RECORDINGS = ROOT / "crates/agentic-server-core/tests/cassettes"
+RECORDINGS = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("messages_recorder", RECORDINGS / "record_cassette.py")
 recorder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recorder)
