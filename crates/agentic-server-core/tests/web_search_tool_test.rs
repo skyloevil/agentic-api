@@ -1689,7 +1689,7 @@ async fn multi_round_stream_has_single_lifecycle_and_monotonic_public_sequence()
         max_output_tokens: Some(1024),
         ignore_eos: None,
         truncation: None,
-        prompt_cache_key: None,
+        prompt_cache_key: Some("workspace-a".to_owned()),
         cache_salt: None,
         metadata: None,
         parallel_tool_calls: None,
@@ -1706,6 +1706,14 @@ async fn multi_round_stream_has_single_lifecycle_and_monotonic_public_sequence()
         .recv()
         .await
         .expect("mock You.com should receive second request");
+
+    let request_bodies = llm.request_bodies().await;
+    assert_eq!(request_bodies.len(), 3);
+    assert!(
+        request_bodies
+            .iter()
+            .all(|body| body["prompt_cache_key"] == "workspace-a")
+    );
 
     let json_events = streamed_sse_events(&chunks);
     assert_single_logical_lifecycle(&json_events);
