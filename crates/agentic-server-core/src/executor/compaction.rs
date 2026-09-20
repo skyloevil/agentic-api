@@ -334,6 +334,7 @@ fn request_payload(model: String, input: ResponsesInput, instructions: Option<St
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     }
