@@ -60,15 +60,18 @@ discovered MCP tools. MCP discovery metadata shares the request's 1 MiB
 response budget with upstream rounds and gateway tool output.
 
 `prompt_cache_key` is forwarded unchanged on direct and executor-backed HTTP
-requests, WebSocket requests, gateway tool rounds, and automatic or
-client-triggered compaction inference. The key is scoped to the current
-request: a continuation using `previous_response_id` must send it again when it
-should remain in the same upstream cache group. Executor-backed requests omit
-the upstream field when it is absent or `null`; direct HTTP requests preserve
-the original body, including an explicit `null`. This support applies to
-`/v1/responses`, not the separate `/v1/responses/compact` endpoint. The
-configured upstream decides whether a request receives a cache hit.
-Response-object echoing remains outside this request-forwarding support.
+requests, WebSocket requests, gateway tool rounds, automatic compaction, and
+summary inference requested by a `compaction_trigger` input item.
+
+- The key is scoped to the current request. A continuation using
+  `previous_response_id` must send it again to remain in the same upstream
+  cache group.
+- Executor-backed requests omit an absent or `null` key. Direct HTTP requests
+  preserve the original body, including an explicit `null`.
+- This support applies to `/v1/responses`. Response-object echoing and the
+  separate `/v1/responses/compact` endpoint are outside its scope.
+
+The configured upstream decides whether a request receives a cache hit.
 
 ### `POST /v1/responses/compact`
 

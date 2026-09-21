@@ -634,10 +634,8 @@ mod tests {
                 move |body: axum::body::Bytes| {
                     let requests = Arc::clone(&requests);
                     async move {
-                        requests
-                            .lock()
-                            .expect("request capture lock")
-                            .push(serde_json::from_slice(&body).expect("valid request JSON"));
+                        let request = serde_json::from_slice(&body).expect("valid request JSON");
+                        requests.lock().expect("request capture lock").push(request);
                         summary_response()
                     }
                 }
