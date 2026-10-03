@@ -69,6 +69,27 @@ model requested by Codex 0.149.1. It then runs `scripts/codex_image_smoke.py`, w
 run explicitly advertises text-only and requires the image to be absent. These cases replay the existing Qwen2.5-VL
 single-image SSE recording unchanged; they validate client/catalog propagation, not fresh model inference.
 
+## Messages web fetch cassettes
+
+`messages/messages-web-fetch-Qwen-Qwen3-8B-{nonstreaming,streaming}.yaml` record the upstream turns of a request that
+declared the native `web_fetch_20250910` tool, as the gateway rewrites it: `messages/web_fetch_tools.json` is the
+function tool the gateway sends upstream and `messages/web_fetch_tool_outputs.json` is the `web_fetch_result` the
+gateway produces for the page `tests/messages_web_fetch_cassette_test.rs` serves. The fed-back `tool_result` carries
+`is_error: false`, as the gateway loop's does. Recorded against vLLM-Metal serving Qwen3-8B (4-bit) as `qwen3` with
+`--enable-auto-tool-choice --tool-call-parser hermes` and thinking off:
+
+```bash
+printf 'Fetch http://127.0.0.1:18080/page/release-notes.html with web_fetch and reply with the verification token it contains, nothing else.\n' \
+  | python record_cassette.py --mode messages --turns 2 --no-stream --vllm http://127.0.0.1:5050 --model qwen3 \
+      --tools messages/web_fetch_tools.json --tool-outputs messages/web_fetch_tool_outputs.json \
+      --output messages/messages-web-fetch-Qwen-Qwen3-8B-nonstreaming.yaml
+```
+
+The streaming cassette is the same command with `--stream`. The replay binds an ephemeral port, serves the recorded
+responses with the origin re-based onto it (the streaming `tool_use` input is re-emitted as one `input_json_delta`,
+since the recorded chunks split the URL), and compares the loop's complete upstream requests with the recording,
+normalizing only the origin and `retrieved_at`.
+
 ## Modes
 
 | Mode | Description |
@@ -211,10 +232,20 @@ turns:
     - "data: {...}\n"
 ```
 
+## Persistent multi-agent WebSocket sessions
+
+The multi-agent recorder supports a persistent duplex capture with
+`MULTI_AGENT_TRANSPORT=websocket`. It reuses the HTTP suite's exact prompts and
+tool fixtures, records actual frames in both directions, injects client outputs
+while reading response events, and retains handshake/close/failure evidence.
+See [the multi-agent recording commands and session format](multi_agent/README.md#persistent-websocket-recordings).
+These files use `sessions`, not the HTTP `turns` schema or synthesized SSE.
+
 ## Recorder scripts
 
 | Script | Cassettes | Backend |
 |--------|-----------|---------|
+| `record_multi_agent_cassettes.sh` | Five delegated scenarios over HTTP JSON/SSE or persistent duplex WebSocket | OpenAI and gateway |
 | `record_text_only_cassettes.sh` | 10 text-only cassettes (responses + conv modes, streaming + non-streaming) | OpenAI (`OPENAI_API_KEY`) |
 | `record_conversations_api_cassettes.sh` | 18 Conversation Items API cassettes: four history scenarios in both transports and one non-streaming edge-case sequence, each for both providers | OpenAI and gateway |
 | `record_reasoning_cassettes.sh` | Matching explicit-reasoning cassettes (streaming + non-streaming) | gateway and OpenAI reference; optional direct vLLM |

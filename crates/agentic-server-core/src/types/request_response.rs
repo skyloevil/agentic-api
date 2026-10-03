@@ -364,6 +364,8 @@ pub struct CompactRequest {
     pub service_tier: Option<String>,
     #[serde(default)]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
     /// Compatibility fields sent by current SDK and Codex clients.
     #[serde(flatten)]
     pub compatibility: HashMap<String, Value>,

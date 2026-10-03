@@ -89,16 +89,17 @@ Continue the agent tree with `previous_response_id`. See
 [HTTP multi-agent execution](https://github.com/vllm-project/agentic-api/blob/main/ARCHITECTURE.md#http-multi-agent-execution).
 
 `prompt_cache_key` is forwarded unchanged on direct and executor-backed HTTP
-requests, WebSocket requests, gateway tool rounds, automatic compaction, and
-summary inference requested by a `compaction_trigger` input item.
+requests, WebSocket requests, gateway tool rounds, automatic compaction,
+standalone `/v1/responses/compact` requests, and summary inference requested by
+a `compaction_trigger` input item.
 
 - The key is scoped to the current request. A continuation using
   `previous_response_id` must send it again to remain in the same upstream
   cache group.
 - Executor-backed requests omit an absent or `null` key. Direct HTTP requests
   preserve the original body, including an explicit `null`.
-- This support applies to `/v1/responses`. Response-object echoing and the
-  separate `/v1/responses/compact` endpoint are outside its scope.
+- The same request-scoped behavior applies when `/v1/responses/compact` loads
+  history through `previous_response_id`. The key is not echoed in responses.
 
 The configured upstream decides whether a request receives a cache hit.
 
@@ -246,7 +247,8 @@ tenant rather than deriving ownership from the authenticated principal
 
 Anthropic Messages requests are forwarded to `{LLM_API_BASE}` with Anthropic
 headers and body fields preserved. When a request declares a tool the gateway
-owns, such as the native `web_search_20250305` server tool, the gateway runs
+owns, such as the native `web_search_20250305` and `web_fetch_20250910`
+server tools, the gateway runs
 the tool loop itself: it executes each gateway call, appends the result, and
 streams only the client-visible content. Every upstream round must be a
 complete, well-formed Messages stream; a truncated or malformed round ends the
