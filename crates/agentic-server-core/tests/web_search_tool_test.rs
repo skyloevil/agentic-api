@@ -8,7 +8,7 @@ use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionConte
 use agentic_core::storage::{ConversationStore, ResponseStore};
 use agentic_core::tool::{GatewayExecutor, ToolOutput, WebSearchHandler};
 use agentic_core::types::event::MessageStatus;
-use agentic_core::types::io::output::{FunctionToolCall, WebSearchCallStatus};
+use agentic_core::types::io::output::{FunctionToolCall, GatewayCallStatus};
 use agentic_core::types::io::{
     FunctionToolResultMessage, InputItem, OutputItem, ResponsesInput, ToolCallOutput, ToolChoice,
 };
@@ -475,7 +475,7 @@ async fn web_search_handler_output_is_byte_identical_for_mock_you_response() {
         status: MessageStatus::Completed,
     };
     let public = handler
-        .public_output(&call, &output, WebSearchCallStatus::Completed, &params)
+        .public_output(&call, &output, GatewayCallStatus::Completed, &params)
         .expect("web_search_call public output");
     assert_eq!(
         serde_json::to_value(&public).unwrap(),
@@ -574,7 +574,7 @@ async fn web_search_handler_normalizes_recorded_you_response() {
         .public_output(
             &call,
             &output,
-            WebSearchCallStatus::Completed,
+            GatewayCallStatus::Completed,
             &WebSearchToolParam::default(),
         )
         .expect("web_search_call public output");
@@ -1204,6 +1204,11 @@ fn assert_request_config_is_preserved(request_bodies: &[serde_json::Value]) {
     assert_eq!(request_bodies[0]["prompt_cache_key"], "workspace-a");
     assert_eq!(request_bodies[1]["prompt_cache_key"], "workspace-a");
     assert!(request_bodies.iter().all(|body| body["service_tier"] == "priority"));
+    assert!(
+        request_bodies
+            .iter()
+            .all(|body| body["prompt_cache_retention"] == "24h")
+    );
     assert_eq!(request_bodies[0]["reasoning"], serde_json::json!({"effort": "high"}));
     assert_eq!(request_bodies[1]["reasoning"], request_bodies[0]["reasoning"]);
     assert_eq!(
@@ -1234,6 +1239,7 @@ async fn execute_runs_web_search_and_sends_tool_output_back_to_model() {
         text: Some(Box::new(json_object_text_config())),
         max_output_tokens: Some(1024),
         prompt_cache_key: Some("workspace-a".to_owned()),
+        prompt_cache_retention: Some(agentic_core::types::request_response::PromptCacheRetention::TwentyFourHours),
         service_tier: Some("priority".to_owned()),
         ..Default::default()
     };
@@ -1612,6 +1618,7 @@ async fn multi_round_stream_has_single_lifecycle_and_monotonic_public_sequence()
         stream: true,
         max_output_tokens: Some(1024),
         prompt_cache_key: Some("workspace-a".to_owned()),
+        prompt_cache_retention: Some(agentic_core::types::request_response::PromptCacheRetention::TwentyFourHours),
         service_tier: Some("priority".to_owned()),
         ..Default::default()
     };
@@ -1636,6 +1643,11 @@ async fn multi_round_stream_has_single_lifecycle_and_monotonic_public_sequence()
     );
 
     assert!(request_bodies.iter().all(|body| body["service_tier"] == "priority"));
+    assert!(
+        request_bodies
+            .iter()
+            .all(|body| body["prompt_cache_retention"] == "24h")
+    );
     let json_events = streamed_sse_events(&chunks);
     assert_single_logical_lifecycle(&json_events);
     assert_contiguous_sequence_numbers(
@@ -2342,12 +2354,12 @@ async fn service_tier_comes_only_from_the_final_tool_round() {
 }
 
 // Reuse synthetic model fixtures; these are not recorded provider cassettes.
-fn with_cache_writes(response: support::MockResponse, writes: Option<i64>) -> support::MockResponse {
+fn with_cache_writes(response: support::MockResponse, writes: Option<serde_json::Value>) -> support::MockResponse {
     match response {
         support::MockResponse::Json(body) => {
             let mut body: serde_json::Value = serde_json::from_str(&body).unwrap();
             if let Some(writes) = writes {
-                body["usage"]["input_tokens_details"]["cache_write_tokens"] = writes.into();
+                body["usage"]["input_tokens_details"]["cache_write_tokens"] = writes;
             }
             support::MockResponse::Json(body.to_string())
         }
@@ -2355,7 +2367,7 @@ fn with_cache_writes(response: support::MockResponse, writes: Option<i64>) -> su
             let mut usage = serde_json::json!({"input_tokens":10,"output_tokens":5,"total_tokens":15,
                 "input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":4}});
             if let Some(writes) = writes {
-                usage["input_tokens_details"]["cache_write_tokens"] = writes.into();
+                usage["input_tokens_details"]["cache_write_tokens"] = writes;
             }
             // Repeat the same snapshot on created/completed events to catch double accounting.
             support::MockResponse::Sse(body.replace("\"usage\":null", &format!("\"usage\":{usage}")))
@@ -2369,10 +2381,12 @@ async fn cache_usage_accumulates_tool_rounds_without_inventing_writes() {
     for stream in [false, true] {
         for (first_writes, last_writes, expected_writes) in [
             (None, None, None),
-            (Some(0), Some(0), Some(0)),
-            (Some(2), Some(3), Some(5)),
-            (None, Some(3), Some(3)),
-            (Some(2), None, Some(2)),
+            (Some(serde_json::json!(0)), Some(serde_json::json!(0)), Some(0)),
+            (Some(serde_json::json!(2)), Some(serde_json::json!(3)), Some(5)),
+            (None, Some(serde_json::json!(3)), Some(3)),
+            (Some(serde_json::json!(2)), None, Some(2)),
+            (Some(serde_json::Value::Null), Some(serde_json::json!(3)), Some(3)),
+            (Some(serde_json::Value::Null), Some(serde_json::Value::Null), None),
         ] {
             let (you_url, mut captured_you, _you_handle) = spawn_mock_you().await;
             let first = if stream {

@@ -39,7 +39,9 @@ use super::handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandl
 use super::ownership::GatewayBinding;
 use super::registry::{ToolEntry, ToolType};
 use crate::config::{DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS, WebSearchProviderConfig, WebSearchProviderKind};
-use crate::types::io::output::{FunctionToolCall, WebSearchCall, WebSearchCallStatus, WebSearchSource};
+use crate::types::io::output::{
+    FunctionToolCall, GatewayCallStatus, WebSearchCall, WebSearchCallStatus, WebSearchSource,
+};
 use crate::types::io::{FunctionTool, OutputItem};
 use crate::types::tools::WebSearchToolParam;
 
@@ -353,10 +355,7 @@ impl WebSearchHandler {
             )));
         }
 
-        Ok(ToolOutput {
-            call_id: call_id.to_owned(),
-            output,
-        })
+        Ok(ToolOutput::success(call_id, output))
     }
 }
 
@@ -434,10 +433,10 @@ impl GatewayExecutor for WebSearchHandler {
         &self,
         call: &FunctionToolCall,
         output: &ToolOutput,
-        status: WebSearchCallStatus,
+        status: GatewayCallStatus,
         _params: &WebSearchToolParam,
     ) -> Option<OutputItem> {
-        output_item(call, output, status)
+        output_item(call, output, status.into())
     }
 }
 
