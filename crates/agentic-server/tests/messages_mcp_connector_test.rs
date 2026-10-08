@@ -372,3 +372,111 @@ async fn truncated_calls_are_public_but_never_executed() {
     let _ = task.await;
     mcp.stop().await;
 }
+
+#[tokio::test]
+async fn malformed_streams_never_dispatch_mcp_calls() {
+    let mcp = fixture::HttpsMcp::start().await;
+    let (url, requests, task) = fixture::inference().await;
+    let router = build_router(
+        common::test_state(&common::test_config(&url)),
+        &ServerConfig::from_env(),
+    );
+    for mode in [
+        "missing_stop",
+        "open_block",
+        "missing_start",
+        "duplicate_block",
+        "delta_after_stop",
+    ] {
+        let body = request(&mcp.url, true, mode);
+        let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.contains("event: error"), "{mode}: {response}");
+        assert!(!response.contains("event: message_stop"), "{mode}: {response}");
+        assert!(!response.contains("mcp_tool_result"), "{mode}: {response}");
+    }
+    assert_eq!(requests.lock().await.len(), 5);
+    assert!(
+        !mcp.observations()
+            .await
+            .iter()
+            .any(|entry| entry["method"] == "tools/call")
+    );
+    task.abort();
+    let _ = task.await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn mixed_calls_resume_with_client_output_without_reexecuting_mcp() {
+    let mcp = fixture::HttpsMcp::start().await;
+    let (url, requests, task) = fixture::inference().await;
+    let router = build_router(
+        common::test_state(&common::test_config(&url)),
+        &ServerConfig::from_env(),
+    );
+    for stream in [false, true] {
+        let mut body = request(&mcp.url, stream, "mixed");
+        body["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"client_echo","input_schema":{"type":"object"}}));
+        let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let content = if stream {
+            response
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|data| serde_json::from_str::<Value>(data).unwrap())
+                .filter(|event| event["type"] == "content_block_start")
+                .map(|event| {
+                    let mut block = event["content_block"].clone();
+                    if block["type"] == "mcp_tool_use" {
+                        block["input"] = json!({"text":"hello"});
+                    }
+                    block
+                })
+                .collect::<Vec<_>>()
+        } else {
+            serde_json::from_str::<Value>(&response).unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            content
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["mcp_tool_use", "tool_use", "mcp_tool_result"]
+        );
+        body["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":content}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"client","content":"client output"}]}),
+        ]);
+        let before = requests.lock().await.len();
+        let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let captured = requests.lock().await;
+        assert_eq!(captured.len(), before + 1);
+        let history = captured.last().unwrap()["messages"].as_array().unwrap();
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["content"][0]["name"], "mcp__counter__echo");
+        assert_eq!(history[1]["content"][1]["name"], "client_echo");
+        assert_eq!(history[2]["role"], "user");
+        assert_eq!(history[2]["content"][0]["tool_use_id"], "call");
+        assert_eq!(history[3]["role"], "user");
+        assert_eq!(history[3]["content"][0]["tool_use_id"], "client");
+    }
+    assert_eq!(
+        mcp.observations()
+            .await
+            .iter()
+            .filter(|entry| entry["method"] == "tools/call")
+            .count(),
+        2
+    );
+    task.abort();
+    let _ = task.await;
+    mcp.stop().await;
+}

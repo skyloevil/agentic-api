@@ -14,21 +14,18 @@
 //! [`crate::types::messages::tool_seam`]. Non-streaming only; streaming lives in
 //! `messages_stream`.
 
-use std::time::Duration;
-
-use futures::future::join_all;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::inference::fetch_response_json_with_headers;
 use crate::executor::messages_context::MessagesRequestContext;
-use crate::executor::messages_request::web_search_budget_exhausted_result;
+use crate::executor::messages_tools::{GatewayToolUse, execute_gateway_calls, request_gateway_map};
 use crate::executor::messages_usage::MessagesUsageTotals;
 use crate::executor::request::ExecutionContext;
 use crate::executor::telemetry::{Api, ExecutionSpan, FailureCategory, Route};
 use crate::tool::ToolRegistry;
-use crate::types::messages::{GatewayToolResult, tool_seam};
+use crate::types::messages::tool_seam;
 use crate::utils::common::deserialize_from_str;
 
 /// Max gateway rounds before the loop gives up. Each round is one upstream
@@ -36,11 +33,6 @@ use crate::utils::common::deserialize_from_str;
 /// Kept in sync with the Responses loop's `engine::MAX_GATEWAY_TOOL_ROUNDS`
 /// (a future Layering-ADR consolidation would unify these).
 pub(super) const MAX_GATEWAY_TOOL_ROUNDS: usize = 10;
-
-/// Per gateway-tool-call timeout — a hung tool becomes an error `tool_result`
-/// fed back to the model, never a whole-request failure (edge E5). Shared with
-/// the streaming loop; matches the Responses loop's `gateway::GATEWAY_TOOL_TIMEOUT`.
-pub(super) const GATEWAY_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-request transport data reused for every upstream Messages round.
 #[derive(Clone, Debug)]
@@ -122,7 +114,7 @@ async fn run_messages_loop_traced(
     // what the client asked (the handler routes streaming elsewhere).
     ctx.force_stream(false);
     let mut usage = MessagesUsageTotals::default();
-    let gateway_map = ctx.gateway_tools_or(&exec_ctx.messages_gateway_tools).clone();
+    let gateway_map = request_gateway_map(ctx.gateway_tools_or(&exec_ctx.messages_gateway_tools), registry);
     let mut public_content = Vec::new();
 
     for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
@@ -165,14 +157,21 @@ async fn run_messages_loop_traced(
                 response_headers,
             ));
         };
-        let (gateway_calls, has_client_tool_use, searches) = split_gateway_calls(content, gateway_map);
+        let (gateway_calls, has_client_tool_use) = split_gateway_calls(content, gateway_map);
 
         if has_client_tool_use {
             // Client execution takes precedence even when the provider labels a
             // named call end_turn. `deliver` keeps the hidden gateway calls out.
             execution.completed_with_stop_reason(stop_reason);
-            let projected =
-                complete_mcp_calls_in_client_round(content, stop_reason, gateway_calls, registry, gateway_map).await?;
+            let projected = complete_mcp_calls_in_client_round(
+                content,
+                stop_reason,
+                gateway_calls,
+                &mut ctx,
+                registry,
+                gateway_map,
+            )
+            .await?;
             let mut message = message;
             if message["stop_reason"] == "end_turn" {
                 message["stop_reason"] = json!("tool_use");
@@ -213,8 +212,7 @@ async fn run_messages_loop_traced(
         // assistant turn (thinking/text/tool_use, order preserved — F3) plus the
         // tool_results back for the next round. Gateway blocks stay internal.
         usage.record(message.get("usage"));
-        let allowed_searches = ctx.reserve_searches(searches);
-        let tool_results = execute_gateway_calls(&gateway_calls, registry, gateway_map, allowed_searches).await;
+        let tool_results = execute_gateway_calls(tool_uses(&gateway_calls), &mut ctx, registry, gateway_map).await;
         let include_visible = ctx
             .tools()
             .is_some_and(|tools| tools.iter().any(|t| t.type_.as_deref() == Some("mcp_toolset")));
@@ -232,31 +230,29 @@ async fn run_messages_loop_traced(
     // Reaching here means every round emitted a gateway tool_use; surface a
     // minimal terminal so the client isn't left hanging.
     execution.failed_with(FailureCategory::RoundBudget);
-    Ok(MessagesResponse {
-        body: round_budget_error(),
+    Ok(round_budget_error())
+}
+
+fn round_budget_error() -> MessagesResponse<Value> {
+    MessagesResponse {
+        body: json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": format!("gateway tool loop exceeded {MAX_GATEWAY_TOOL_ROUNDS} rounds")
+            }
+        }),
         headers: http::HeaderMap::new(),
-    })
+    }
 }
 
-fn round_budget_error() -> Value {
-    json!({
-        "type": "error",
-        "error": {
-            "type": "api_error",
-            "message": format!("gateway tool loop exceeded {MAX_GATEWAY_TOOL_ROUNDS} rounds")
-        }
-    })
-}
-
-fn split_gateway_calls(content: &[Value], gateway_map: &tool_seam::GatewayToolMap) -> (Vec<Value>, bool, usize) {
+fn split_gateway_calls(content: &[Value], gateway_map: &tool_seam::GatewayToolMap) -> (Vec<Value>, bool) {
     let mut gateway_calls: Vec<Value> = Vec::new();
     let mut has_client_tool_use = false;
-    let mut searches = 0;
     for block in content {
         if block.get("type").and_then(Value::as_str) == Some("tool_use") {
             let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
             if gateway_map.is_gateway_owned(name) {
-                searches += usize::from(gateway_map.mcp_identity(name).is_none());
                 gateway_calls.push(block.clone());
             } else {
                 has_client_tool_use = true;
@@ -264,13 +260,14 @@ fn split_gateway_calls(content: &[Value], gateway_map: &tool_seam::GatewayToolMa
         }
     }
 
-    (gateway_calls, has_client_tool_use, searches)
+    (gateway_calls, has_client_tool_use)
 }
 
 async fn complete_mcp_calls_in_client_round(
     content: &[Value],
     stop_reason: Option<&str>,
     mut gateway_calls: Vec<Value>,
+    ctx: &mut MessagesRequestContext,
     registry: &ToolRegistry,
     gateway_map: &tool_seam::GatewayToolMap,
 ) -> ExecutorResult<Option<Value>> {
@@ -283,7 +280,7 @@ async fn complete_mcp_calls_in_client_round(
         return Ok(None);
     }
     let results = if matches!(stop_reason, Some("tool_use" | "end_turn")) {
-        execute_gateway_calls(&gateway_calls, registry, gateway_map, 0).await
+        execute_gateway_calls(tool_uses(&gateway_calls), ctx, registry, gateway_map).await
     } else {
         Vec::new()
     };
@@ -325,61 +322,21 @@ fn deliver(
     MessagesResponse { body: message, headers }
 }
 
-/// Execute the gateway-owned `tool_use` blocks concurrently, each bounded by the
-/// per-call timeout. A failure or timeout becomes an error `tool_result` (E5).
+/// The round's gateway-owned `tool_use` blocks as dispatchable calls.
 ///
-/// Returns one `tool_result` block per call, fed back next round. (The model's
-/// own `tool_use` block is carried forward via the preserved assistant content,
-/// not reconstructed here — see [`MessagesRequestContext::append_round`].)
-async fn execute_gateway_calls(
-    gateway_calls: &[Value],
-    registry: &ToolRegistry,
-    gateway_map: &tool_seam::GatewayToolMap,
-    allowed_searches: usize,
-) -> Vec<GatewayToolResult> {
-    let futures = gateway_calls.iter().enumerate().map(|(index, block)| async move {
-        let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-        let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
-
-        if gateway_map.mcp_identity(name).is_none()
-            && gateway_calls[..index]
-                .iter()
-                .filter(|block| {
-                    gateway_map
-                        .mcp_identity(block["name"].as_str().unwrap_or_default())
-                        .is_none()
-                })
-                .count()
-                >= allowed_searches
-        {
-            return web_search_budget_exhausted_result(id);
-        }
-
-        // F4: reject a malformed/absent input rather than dispatching with args
-        // the model never supplied. The block's `input` is already-parsed JSON
-        // here (non-streaming), so validate it's an object.
-        let input = block.get("input").cloned().unwrap_or(Value::Null);
-        let (output, is_error) = if input.is_object() {
-            let call = tool_seam::tool_use_to_call(id, name, &input, gateway_map);
-            match tokio::time::timeout(GATEWAY_TOOL_TIMEOUT, registry.dispatch(&call)).await {
-                Ok(Some(result)) => match result.output {
-                    Ok(tool_output) => (tool_output.output, false),
-                    Err(e) => (format!("tool execution failed: {e}"), true),
-                },
-                Ok(None) => (format!("no handler for tool '{name}'"), true),
-                Err(_) => (
-                    format!("gateway tool '{name}' timed out after {GATEWAY_TOOL_TIMEOUT:?}"),
-                    true,
-                ),
-            }
-        } else {
-            (
-                "invalid tool arguments (not a JSON object); tool was not run".to_owned(),
-                true,
-            )
-        };
-
-        tool_seam::tool_result_block(id, output, is_error)
-    });
-    join_all(futures).await
+/// F4: a malformed/absent input is reported rather than dispatched with args the
+/// model never supplied. The block's `input` is already-parsed JSON here
+/// (non-streaming), so it only has to be an object.
+fn tool_uses(gateway_calls: &[Value]) -> Vec<GatewayToolUse<'_>> {
+    gateway_calls
+        .iter()
+        .map(|block| GatewayToolUse {
+            id: block.get("id").and_then(Value::as_str).unwrap_or_default(),
+            name: block.get("name").and_then(Value::as_str).unwrap_or_default(),
+            input: match block.get("input") {
+                Some(input) if input.is_object() => Ok(input.clone()),
+                _ => Err("invalid tool arguments (not a JSON object)".to_owned()),
+            },
+        })
+        .collect()
 }

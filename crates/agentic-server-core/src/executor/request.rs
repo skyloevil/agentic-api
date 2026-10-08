@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,6 +6,7 @@ use crate::config::{Config, ResponsesConfig, default_database_url};
 use crate::error::Error;
 use crate::executor::gateway::GatewaySchedulerPolicy;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
+use crate::executor::multi_agent::ValidatedTreeCheckpoint;
 use crate::storage::backend::redact_database_urls;
 use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
@@ -22,6 +24,8 @@ const GATEWAY_TOOL_ALIASES_ENV: &str = "MESSAGES_GATEWAY_TOOL_ALIASES";
 /// Context built by `rehydrate_conversation`, threaded through the execute pipeline.
 #[derive(Debug)]
 pub struct RequestContext {
+    /// Private canonical tree; committed atomically with response metadata.
+    pub multi_agent_tree: Option<ValidatedTreeCheckpoint>,
     /// Untouched original request from the client.
     pub original_request: RequestPayload,
     /// Enriched request with rehydrated conversation history injected into `.input`.
@@ -43,6 +47,13 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    /// The request's `max_tool_calls` limit. Admission already rejected an
+    /// invalid value, so `None` means the request set no limit.
+    #[must_use]
+    pub fn max_tool_calls(&self) -> Option<NonZeroU64> {
+        self.original_request.max_tool_calls_limit().ok().flatten()
+    }
+
     /// Inject our `response_id` and `conversation_id` into a `ResponsePayload`
     /// received from the LLM (which carries the upstream's own IDs).
     pub(crate) fn inject_ids(&self, payload: &mut ResponsePayload) {
@@ -51,6 +62,7 @@ impl RequestContext {
         payload
             .previous_response_id
             .clone_from(&self.original_request.previous_response_id);
+        payload.max_tool_calls = self.max_tool_calls().map(NonZeroU64::get);
     }
 }
 
@@ -174,7 +186,7 @@ impl ExecutionContext {
         let resp_handler = ResponseHandler::new(ResponseStore::new(pool.clone()));
         let client = Arc::new(reqwest::Client::new());
         let gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
-            .map_err(|error| Error::Config(format!("failed to validate configured MCP server policies: {error}")))?;
+            .map_err(|error| Error::Config(format!("failed to validate configured gateway tool policies: {error}")))?;
         Ok(Self {
             conv_handler,
             resp_handler,

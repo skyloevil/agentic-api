@@ -6,6 +6,8 @@
 //! it knows what to execute, (2) turn an assistant `tool_use` block into the
 //! `FunctionToolCall` that `ToolRegistry::dispatch` consumes, and (3) turn the
 //! resulting `ToolOutput` back into a `tool_result` block to feed the next round.
+//! Mapping declared tools to the registry's declarations is the tool layer's
+//! (`tool::registry_tools`).
 //!
 //! These are pure conversions with no I/O — the loop (`executor::messages_loop`)
 //! and the registry supply the behaviour around them.
@@ -16,20 +18,32 @@ use serde_json::{Map, Value, json};
 
 use crate::types::event::MessageStatus;
 use crate::types::io::output::FunctionToolCall;
-use crate::types::tools::{
-    FunctionToolParam, ResponsesTool, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
-};
-use crate::utils::common::{deserialize_from_value_opt, serialize_to_value};
+use crate::utils::common::serialize_to_value;
 
 use super::request::{GatewayToolResult, ToolParam};
 
-/// The one built-in gateway executor exposed on `/v1/messages` today. The
+/// The built-in gateway executor every `/v1/messages` request may name. The
 /// registry keys it under this exact name (`tool::web_search`).
 pub const WEB_SEARCH_EXECUTOR: &str = "web_search";
 
 /// Claude's basic native web-search server tool version, supported by the
 /// Messages gateway loop as a gateway-owned tool.
 pub const NATIVE_WEB_SEARCH_TYPE: &str = "web_search_20250305";
+
+/// The second built-in gateway executor on `/v1/messages`, reachable only
+/// through a native `web_fetch_*` declaration (`tool::web_fetch`).
+pub const WEB_FETCH_EXECUTOR: &str = "web_fetch";
+
+/// Claude's basic native web-fetch server tool version, the one the Messages
+/// gateway loop executes.
+pub const NATIVE_WEB_FETCH_TYPE: &str = "web_fetch_20250910";
+
+/// Whether a declared tool `type` names a native web-fetch server tool, of
+/// any version. Version support is decided when the request is normalized.
+#[must_use]
+pub fn is_native_web_fetch_type(tool_type: Option<&str>) -> bool {
+    tool_type.is_some_and(|tool_type| tool_type.starts_with("web_fetch_"))
+}
 
 /// Operator-configured map of client-declared tool names to gateway executors.
 ///
@@ -43,12 +57,19 @@ pub const NATIVE_WEB_SEARCH_TYPE: &str = "web_search_20250305";
 /// routes through the Responses loop.
 ///
 /// The canonical executor `web_search` is always recognised; the map only adds
-/// operator-approved *aliases* on top.
+/// operator-approved *aliases* on top. The `web_fetch` executor is recognised
+/// per request: the Messages loop marks it owned
+/// ([`with_web_fetch_owned`](Self::with_web_fetch_owned)) when the
+/// request-scoped registry bound the name to the gateway executor, which only
+/// a native `web_fetch_*` declaration does.
 #[derive(Clone, Debug, Default)]
 pub struct GatewayToolMap {
     /// client tool name (as the model calls it) → canonical executor key.
     aliases: HashMap<String, String>,
     mcp_tools: HashMap<String, (String, String)>,
+    /// Whether `web_fetch` is gateway-owned for this request. Never an
+    /// operator setting: a plain function named `web_fetch` is the client's.
+    web_fetch: bool,
 }
 
 impl GatewayToolMap {
@@ -65,6 +86,7 @@ impl GatewayToolMap {
         Self {
             aliases,
             mcp_tools: HashMap::new(),
+            web_fetch: false,
         }
     }
 
@@ -114,6 +136,15 @@ impl GatewayToolMap {
         Self::from_pairs(pairs)
     }
 
+    /// The map for one request, with `web_fetch` gateway-owned or not. The
+    /// Messages loop derives `owned` from the request-scoped registry, so the
+    /// decision lives with the resolved registry entries, not here.
+    #[must_use]
+    pub fn with_web_fetch_owned(mut self, owned: bool) -> Self {
+        self.web_fetch = owned;
+        self
+    }
+
     /// The canonical executor key for a declared tool name, if it is
     /// gateway-owned: the built-in `web_search`, or a configured alias.
     #[must_use]
@@ -123,6 +154,8 @@ impl GatewayToolMap {
         }
         if name == WEB_SEARCH_EXECUTOR {
             Some(WEB_SEARCH_EXECUTOR)
+        } else if self.web_fetch && name == WEB_FETCH_EXECUTOR {
+            Some(WEB_FETCH_EXECUTOR)
         } else {
             self.aliases.get(name).map(String::as_str)
         }
@@ -136,78 +169,17 @@ impl GatewayToolMap {
 
 /// True if the request declares at least one gateway-owned tool — the routing
 /// gate that decides loop vs. transparent proxy. Gateway ownership is resolved
-/// against the operator-configured [`GatewayToolMap`].
+/// against the operator-configured [`GatewayToolMap`], plus the native server
+/// tools only the gateway can execute.
 #[must_use]
 pub fn has_gateway_tool(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) -> bool {
     tools.is_some_and(|tools| {
-        tools
-            .iter()
-            .any(|t| t.type_.as_deref() == Some("mcp_toolset") || map.is_gateway_owned(&t.name))
+        tools.iter().any(|t| {
+            t.type_.as_deref() == Some("mcp_toolset")
+                || map.is_gateway_owned(&t.name)
+                || is_native_web_fetch_type(t.type_.as_deref())
+        })
     })
-}
-
-/// Map declared Anthropic tools to the internal `ResponsesTool` list used to
-/// build a request-scoped `ToolRegistry`. Gateway-owned tools (built-in or
-/// configured alias) become the matching gateway variant — the registry keys
-/// the `web_search` executor under its canonical name, and dispatch
-/// canonicalises the call name to match ([`tool_use_to_call`]). Everything else
-/// becomes a client-owned `Function`.
-#[must_use]
-pub fn registry_tools(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) -> Vec<ResponsesTool> {
-    let Some(tools) = tools else {
-        return Vec::new();
-    };
-    tools.iter().filter_map(|t| map_tool(t, map)).collect()
-}
-
-fn map_tool(tool: &ToolParam, map: &GatewayToolMap) -> Option<ResponsesTool> {
-    if tool.type_.as_deref() == Some("mcp_toolset") {
-        return None;
-    }
-    if map.canonical_executor(&tool.name) == Some(WEB_SEARCH_EXECUTOR) {
-        return Some(ResponsesTool::WebSearch(web_search_config(tool)));
-    }
-    let name = tool.name.clone().try_into().ok()?;
-    Some(ResponsesTool::Function(FunctionToolParam {
-        name,
-        description: tool.description.clone(),
-        parameters: tool.input_schema.clone(),
-        strict: None,
-        defer_loading: tool.defer_loading,
-        extra: std::collections::HashMap::new(),
-    }))
-}
-
-fn web_search_config(tool: &ToolParam) -> WebSearchToolParam {
-    if tool.type_.as_deref() != Some(NATIVE_WEB_SEARCH_TYPE) {
-        return WebSearchToolParam::default();
-    }
-
-    let allowed_domains = tool
-        .extra
-        .get("allowed_domains")
-        .cloned()
-        .and_then(deserialize_from_value_opt);
-    let blocked_domains = tool
-        .extra
-        .get("blocked_domains")
-        .cloned()
-        .and_then(deserialize_from_value_opt);
-    let filters = (allowed_domains.is_some() || blocked_domains.is_some()).then_some(WebSearchFilters {
-        allowed_domains,
-        blocked_domains,
-    });
-    let user_location = tool
-        .extra
-        .get("user_location")
-        .cloned()
-        .and_then(deserialize_from_value_opt::<WebSearchUserLocation>);
-
-    WebSearchToolParam {
-        search_context_size: None,
-        filters,
-        user_location,
-    }
 }
 
 /// Turn an assistant `tool_use` block into the `FunctionToolCall` that
@@ -228,6 +200,7 @@ pub fn tool_use_to_call(id: &str, name: &str, input: &Value, map: &GatewayToolMa
         input.clone()
     };
     FunctionToolCall {
+        agent: None,
         id: id.to_owned(),
         call_id: id.to_owned(),
         name: canonical.to_owned(),
@@ -376,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn web_search_is_gateway_owned_and_maps_to_gateway_variant() {
+    fn web_search_is_gateway_owned() {
         let map = default_map();
         assert!(map.is_gateway_owned("web_search"));
         assert!(!map.is_gateway_owned("get_weather"));
@@ -386,24 +359,20 @@ mod tests {
             "tools": [{"name": "web_search", "input_schema": {"type": "object"}}]
         }));
         assert!(has_gateway_tool(tools.as_ref(), &map));
-        let mapped = registry_tools(tools.as_ref(), &map);
-        assert!(matches!(mapped.as_slice(), [ResponsesTool::WebSearch(_)]));
     }
 
     #[test]
-    fn custom_tool_stays_client_owned_function() {
+    fn custom_tool_stays_client_owned() {
         let map = default_map();
         let tools = tools_of(json!({
             "model": "m", "max_tokens": 10, "messages": [],
             "tools": [{"name": "get_weather", "description": "local", "input_schema": {"type": "object"}}]
         }));
         assert!(!has_gateway_tool(tools.as_ref(), &map));
-        let mapped = registry_tools(tools.as_ref(), &map);
-        assert!(matches!(mapped.as_slice(), [ResponsesTool::Function(_)]));
     }
 
     #[test]
-    fn mixed_tools_classify_independently() {
+    fn mixed_tools_take_the_loop() {
         let map = default_map();
         let tools = tools_of(json!({
             "model": "m", "max_tokens": 10, "messages": [],
@@ -413,16 +382,11 @@ mod tests {
             ]
         }));
         assert!(has_gateway_tool(tools.as_ref(), &map));
-        let mapped = registry_tools(tools.as_ref(), &map);
-        assert!(matches!(mapped[0], ResponsesTool::WebSearch(_)));
-        assert!(matches!(mapped[1], ResponsesTool::Function(_)));
     }
 
     #[test]
-    fn no_tools_is_not_gateway_and_maps_empty() {
-        let map = default_map();
-        assert!(!has_gateway_tool(None, &map));
-        assert!(registry_tools(None, &map).is_empty());
+    fn no_tools_is_not_gateway() {
+        assert!(!has_gateway_tool(None, &default_map()));
     }
 
     // Claude Code declares its web search as a client function `WebSearch`. With
@@ -437,19 +401,11 @@ mod tests {
         }));
         // Default: not gateway-owned (doctrine default — unless configured).
         assert!(!has_gateway_tool(tools.as_ref(), &default_map()));
-        assert!(matches!(
-            registry_tools(tools.as_ref(), &default_map()).as_slice(),
-            [ResponsesTool::Function(_)]
-        ));
-        // Aliased: gateway-owned, maps to the WebSearch executor variant.
+        // Aliased: gateway-owned, dispatching to the web_search executor.
         let map = alias_map();
         assert!(map.is_gateway_owned("WebSearch"));
         assert_eq!(map.canonical_executor("WebSearch"), Some("web_search"));
         assert!(has_gateway_tool(tools.as_ref(), &map));
-        assert!(matches!(
-            registry_tools(tools.as_ref(), &map).as_slice(),
-            [ResponsesTool::WebSearch(_)]
-        ));
     }
 
     #[test]
@@ -566,5 +522,75 @@ mod tests {
         call.arguments = "not json".to_owned();
         let block = call_to_tool_use_block(&call);
         assert_eq!(block["input"], json!({}));
+    }
+
+    #[test]
+    fn a_native_web_fetch_declaration_routes_to_the_loop() {
+        let tools = tools_of(json!({
+            "model": "m", "max_tokens": 10, "messages": [],
+            "tools": [{"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 2,
+                       "allowed_domains": ["example.com"], "max_content_tokens": 5000}]
+        }));
+        let map = default_map();
+        assert!(
+            !map.is_gateway_owned("web_fetch"),
+            "the operator map alone never owns web_fetch"
+        );
+        assert!(
+            has_gateway_tool(tools.as_ref(), &map),
+            "a native declaration takes the loop"
+        );
+
+        // Ownership for the loop comes from the registry, through the adapter.
+        let owned = map.clone().with_web_fetch_owned(true);
+        assert_eq!(owned.canonical_executor("web_fetch"), Some("web_fetch"));
+        assert!(owned.is_gateway_owned("web_search"), "web_search stays recognised");
+        assert!(!map.clone().with_web_fetch_owned(false).is_gateway_owned("web_fetch"));
+
+        // Any web_fetch_* version routes to the loop; the version itself is
+        // judged when the request is normalized.
+        let later = tools_of(json!({
+            "model": "m", "max_tokens": 10, "messages": [],
+            "tools": [{"type": "web_fetch_20260318", "name": "web_fetch"}]
+        }));
+        assert!(has_gateway_tool(later.as_ref(), &map));
+        // Operator aliases cannot point at web_fetch.
+        assert!(!GatewayToolMap::from_env_str("WebFetch=web_fetch").is_gateway_owned("WebFetch"));
+    }
+
+    #[test]
+    fn a_plain_function_named_web_fetch_stays_client_owned() {
+        let tools = tools_of(json!({
+            "model": "m", "max_tokens": 10, "messages": [],
+            "tools": [{"name": "web_fetch", "input_schema": {"type": "object"}}]
+        }));
+        assert!(!has_gateway_tool(tools.as_ref(), &default_map()));
+        let map = default_map();
+        assert!(!map.is_gateway_owned("web_fetch"));
+        let content = vec![json!({"type": "tool_use", "name": "web_fetch", "id": "c"})];
+        assert_eq!(
+            strip_gateway_tool_use(&content, &map).len(),
+            1,
+            "the client's call stays visible"
+        );
+    }
+
+    #[test]
+    fn web_fetch_calls_dispatch_under_their_own_name_without_adaptation() {
+        let map = default_map().with_web_fetch_owned(true);
+        let call = tool_use_to_call("toolu_f", "web_fetch", &json!({"url": "https://example.com/a"}), &map);
+        assert_eq!(call.name, "web_fetch");
+        assert_eq!(call.call_id, "toolu_f");
+        let args: Value = serde_json::from_str(&call.arguments).unwrap();
+        assert_eq!(args["url"], "https://example.com/a");
+        let content = vec![
+            json!({"type": "text", "text": "t"}),
+            json!({"type": "tool_use", "name": "web_fetch", "id": "g"}),
+        ];
+        assert_eq!(
+            strip_gateway_tool_use(&content, &map).len(),
+            1,
+            "the gateway fetch is hidden"
+        );
     }
 }

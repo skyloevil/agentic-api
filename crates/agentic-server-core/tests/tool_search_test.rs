@@ -60,10 +60,7 @@ impl GatewayExecutor for CountingWebSearch {
         _config: &WebSearchToolParam,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(std::future::ready(Ok(ToolOutput {
-            call_id: call_id.to_owned(),
-            output: "must not execute".to_owned(),
-        })))
+        Box::pin(std::future::ready(Ok(ToolOutput::success(call_id, "must not execute"))))
     }
 }
 
@@ -711,7 +708,7 @@ async fn streaming_incomplete_search_preserves_public_item_in_terminal_response(
 }
 
 #[tokio::test]
-async fn streaming_rejects_a_second_search_call_before_its_added_event() {
+async fn streaming_rejects_duplicate_search_call_ids_before_their_added_event() {
     let cases = [
         (
             "synthetic",
@@ -730,7 +727,8 @@ async fn streaming_rejects_a_second_search_call_before_its_added_event() {
         ),
     ];
 
-    for (case, first, second) in cases {
+    for (case, first, mut second) in cases {
+        second["call_id"] = first["call_id"].clone();
         let upstream = streaming_response([
             json!({
                 "type": "response.created",
@@ -994,7 +992,7 @@ async fn blocking_incomplete_search_preserves_a_non_replayable_public_item() {
 }
 
 #[tokio::test]
-async fn blocking_rejects_multiple_search_calls_in_native_synthetic_or_mixed_output() {
+async fn blocking_accepts_distinct_search_calls_in_native_synthetic_or_mixed_output() {
     let completed_synthetic = |suffix| synthetic_search_call(suffix, "{}", "completed");
     let completed_native = |suffix| native_search_call(suffix, &json!({}), "completed");
     let cases = [
@@ -1022,11 +1020,16 @@ async fn blocking_rejects_multiple_search_calls_in_native_synthetic_or_mixed_out
             &json!([search_declaration(), deferred_weather()]),
         );
 
-        let Err(error) = ExecuteRequest::new(request, context).run().await else {
-            panic!("{case}: multiple search calls must be rejected");
+        let Either::Left(response) = ExecuteRequest::new(request, context).run().await.expect(case) else {
+            panic!("blocking response expected");
         };
-        assert_eq!(error.http_status(), http::StatusCode::BAD_GATEWAY, "{case}");
-        assert_eq!(error.error_type(), "tool_error", "{case}");
+        assert_eq!(response.output.len(), 2, "{case}");
+        assert!(
+            response
+                .output
+                .iter()
+                .all(|item| matches!(item, OutputItem::ToolSearchCall(_)))
+        );
     }
 }
 

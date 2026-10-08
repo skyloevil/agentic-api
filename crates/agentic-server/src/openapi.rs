@@ -11,6 +11,8 @@ use utoipa::OpenApi;
         license(name = "Apache-2.0"),
     ),
     paths(
+        crate::handler::http::chat_completions::chat_completions,
+        crate::handler::http::chat_completions::completions,
         crate::handler::http::models::health,
         crate::handler::http::models::ready,
         crate::handler::http::models::models,
@@ -56,6 +58,21 @@ use utoipa::OpenApi;
         agentic_core::types::io::CompactionItem,
         agentic_core::types::io::CustomToolCallOutputMessage,
         agentic_core::types::io::OutputItem,
+        agentic_core::types::io::MultiAgentConfig,
+        agentic_core::types::io::AgentAttribution,
+        agentic_core::types::io::MultiAgentAction,
+        agentic_core::types::io::MultiAgentCall,
+        agentic_core::types::io::InputMultiAgentCall,
+        agentic_core::types::io::MultiAgentCallOutput,
+        agentic_core::types::io::InputMultiAgentCallOutput,
+        agentic_core::types::io::MultiAgentCallOutputContent,
+        agentic_core::types::io::AgentMessage,
+        agentic_core::types::io::InputAgentMessage,
+        agentic_core::types::io::AgentMessageContent,
+        agentic_core::types::io::MessagePhase,
+        agentic_core::types::io::OutputMessageContent,
+        agentic_core::types::io::OutputTextLogprob,
+        agentic_core::types::io::TopLogprob,
         agentic_core::types::io::OutputTextContent,
         agentic_core::types::io::OutputMessage,
         agentic_core::types::io::FunctionToolCall,
@@ -63,6 +80,7 @@ use utoipa::OpenApi;
         agentic_core::types::io::CustomToolCall,
         agentic_core::types::io::ShellCall,
         agentic_core::types::io::ShellCallAction,
+        agentic_core::types::io::ShellCallLimit,
         agentic_core::types::io::ShellCallStatus,
         agentic_core::types::io::ShellCallOutputMessage,
         agentic_core::types::io::ShellCallOutputContent,
@@ -89,6 +107,10 @@ use utoipa::OpenApi;
         agentic_core::types::io::AllowedTool,
         agentic_core::types::io::AllowedToolsMode,
         agentic_core::types::io::GatewayCallStatus,
+        agentic_core::types::io::CodeInterpreterCall,
+        agentic_core::types::io::CodeInterpreterCallOutput,
+        agentic_core::types::io::CodeInterpreterCallStatus,
+        agentic_core::types::io::CodeInterpreterCallStreamEvent,
         agentic_core::types::io::McpCallStatus,
         agentic_core::types::event::ResponseStatus,
         agentic_core::types::event::MessageStatus,
@@ -101,10 +123,12 @@ use utoipa::OpenApi;
         agentic_core::types::tools::McpToolParam,
         agentic_core::types::tools::WebSearchToolParam,
         agentic_core::types::tools::WebSearchContextSize,
-        agentic_core::types::tools::WebSearchFilters,
+        agentic_core::types::tools::DomainFilters,
         agentic_core::types::tools::WebSearchUserLocation,
         agentic_core::types::tools::FileSearchToolParam,
         agentic_core::types::tools::CodeInterpreterToolParam,
+        agentic_core::types::tools::params::CodeInterpreterAutoContainer,
+        agentic_core::types::tools::params::CodeInterpreterAutoContainerType,
         agentic_core::types::tools::ShellToolParam,
         agentic_core::types::tools::ShellEnvironment,
         agentic_core::types::tools::LocalShellEnvironment,
@@ -437,6 +461,35 @@ mod tests {
         assert!(ignore_eos.is_object(), "RequestPayload.ignore_eos is undocumented");
     }
 
+    #[test]
+    fn reasoning_schema_uses_typed_summary_state_and_status() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("spec must serialize");
+        let wrapper = serde_json::json!({
+            "components": spec["components"], "$ref": "#/components/schemas/ReasoningOutput"
+        });
+        let validator = jsonschema::validator_for(&wrapper).expect("reasoning schema must resolve");
+        let valid = serde_json::json!({
+            "id": "rs_1", "content": [{"type":"reasoning_text","text":"thinking"}],
+            "summary": [{"type":"summary_text","text":"summary"}],
+            "encrypted_content": "opaque", "status": "completed"
+        });
+        assert!(validator.is_valid(&valid));
+        for (field, malformed) in [
+            ("encrypted_content", serde_json::json!({"ciphertext":"opaque"})),
+            ("summary", serde_json::json!(["untyped"])),
+            (
+                "content",
+                serde_json::json!([{"type":"summary_text","text":"wrong kind"}]),
+            ),
+            ("status", serde_json::json!("complete")),
+        ] {
+            let mut item = valid.clone();
+            item[field] = malformed;
+            assert!(!validator.is_valid(&item), "schema accepted malformed {field}");
+            assert!(serde_json::from_value::<agentic_core::ReasoningOutput>(item).is_err());
+        }
+    }
+
     /// Validates that JSON fixtures representing each tagged-enum variant
     /// pass the hand-written `OpenAPI` schema. Catches schema drift that
     /// structural tests (ref resolution, meta-schema) cannot.
@@ -589,13 +642,50 @@ mod tests {
             serde_json::json!({"type": "mcp", "server_label": "s"}),
             serde_json::json!({"type": "web_search_preview"}),
             serde_json::json!({"type": "file_search"}),
-            serde_json::json!({"type": "code_interpreter"}),
+            serde_json::json!({"type": "code_interpreter", "container": {"type": "auto"}}),
             serde_json::json!({"type": "shell", "environment": {"type": "local"}}),
             serde_json::json!({"type": "namespace", "name": "ns", "tools": []}),
             serde_json::json!({"type": "custom", "name": "c"}),
         ];
         for fixture in &tools {
             validate("ResponsesTool", fixture);
+        }
+
+        let containerless_code_interpreter = serde_json::json!({"type": "code_interpreter"});
+        let tool_schema = serde_json::json!({
+            "components": { "schemas": schemas },
+            "$ref": "#/components/schemas/ResponsesTool"
+        });
+        let tool_validator = jsonschema::validator_for(&tool_schema).expect("valid ResponsesTool schema");
+        assert!(
+            tool_validator
+                .iter_errors(&containerless_code_interpreter)
+                .next()
+                .is_some(),
+            "schema must require a code-interpreter container"
+        );
+        assert!(
+            serde_json::from_value::<agentic_core::types::tools::ResponsesTool>(containerless_code_interpreter)
+                .is_err(),
+            "serde must require a code-interpreter container"
+        );
+
+        for unsupported in [
+            serde_json::json!({"type": "code_interpreter", "execution": "gateway"}),
+            serde_json::json!({
+                "type": "code_interpreter",
+                "container": {"type": "auto"},
+                "execution": "gateway"
+            }),
+        ] {
+            assert!(
+                tool_validator.iter_errors(&unsupported).next().is_some(),
+                "schema must reject the unsupported gateway selector: {unsupported}"
+            );
+            assert!(
+                serde_json::from_value::<agentic_core::types::tools::ResponsesTool>(unsupported).is_err(),
+                "serde must reject the unsupported gateway selector"
+            );
         }
 
         // -- ToolChoice: all accepted forms including legacy --

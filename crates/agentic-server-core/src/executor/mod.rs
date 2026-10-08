@@ -10,8 +10,10 @@ pub mod messages_context;
 pub mod messages_loop;
 mod messages_request;
 pub mod messages_stream;
+mod messages_tools;
 mod messages_usage;
 pub mod modes;
+pub mod multi_agent;
 pub mod persist;
 mod prepare;
 pub mod rehydrate;
@@ -28,13 +30,15 @@ mod response_budget;
 mod upstream;
 
 pub use compaction::compact_response;
-pub use engine::{BoxStream, ExecuteRequest, create_conversation, execute};
+pub use engine::{BoxStream, ExecuteRequest, create_conversation, execute, prepare_non_generating_turn};
 pub use error::{ExecutorError, ExecutorResult, ResourceLimit};
 pub use inference::call_inference;
 pub use messages_connector::prepare_messages_count_tokens;
 pub use messages_context::{MessagesRequestContext, ParsedMessagesRequest};
 pub use messages_loop::{MessagesResponse, MessagesUpstream, run_messages_loop};
-pub use messages_request::normalize_native_web_search_for_upstream;
+pub use messages_request::{
+    declares_native_web_fetch, normalize_native_server_tools_for_upstream, normalize_native_web_search_for_upstream,
+};
 pub use messages_stream::run_messages_stream;
 pub use modes::{ConversationHandler, ResponseHandler};
 pub use persist::{commit, persist_response, persist_turn};
@@ -43,3 +47,6 @@ pub use request::ExecutionContext;
 pub use request::RequestContext;
 pub use session::{ResponseSession, ResponseSessionGroup};
 pub use upstream::{UpstreamBody, decode_upstream, upstream_request};
+
+pub mod response_events;
+pub use engine::retained::{ResponseRunOwner, RunningResponse};

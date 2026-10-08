@@ -3,15 +3,26 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use super::code_interpreter::CodeInterpreterHandler;
+use super::declaration::ToolDeclaration;
 use super::mcp::handler::McpServerToolSet;
 use super::mcp::{McpClientPool, McpDiscoveredHandler, McpHandler};
+use super::normalize::code_interpreter_unavailable_error;
+use super::web_fetch::{WebFetchExecutor, WebFetchHandler};
 use super::web_search::{WebSearchExecutor, WebSearchHandler};
 use super::{GatewayExecutor, ToolError};
-use crate::config::ToolRuntimeConfig;
+use crate::config::{DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS, ToolRuntimeConfig, WebFetchConfig};
 use crate::types::tools::McpToolParam;
+
+use super::code_interpreter::CodeInterpreterExecutor;
+
+/// The error for a native `web_fetch` declaration on a gateway whose operator
+/// disabled the executor.
+const WEB_FETCH_UNAVAILABLE: &str = "web_fetch is disabled by operator configuration";
 
 pub enum GatewayExecutorRegistration {
     WebSearch(Arc<WebSearchExecutor>),
+    WebFetch(Arc<WebFetchExecutor>),
     Mcp {
         server_label: String,
         handlers: Vec<McpDiscoveredHandler>,
@@ -49,6 +60,10 @@ pub struct GatewayExecutors {
     mcp_discovered: Arc<RwLock<HashMap<String, Vec<McpDiscoveredHandler>>>>,
     mcp_allowed_hosts: Vec<String>,
     web_search: Option<Arc<WebSearchExecutor>>,
+    /// Present unless the operator disabled the built-in `web_fetch` executor.
+    web_fetch: Option<Arc<WebFetchExecutor>>,
+    /// Present only after an opted-in provider passes startup readiness checks.
+    code_interpreter: Option<Arc<CodeInterpreterExecutor>>,
 }
 
 impl GatewayExecutors {
@@ -61,6 +76,11 @@ impl GatewayExecutors {
             mcp_discovered: Arc::new(RwLock::new(HashMap::new())),
             mcp_allowed_hosts: super::mcp::pool::allowed_hosts_from_env(),
             web_search: Some(Arc::new(WebSearchHandler::from_env(client))),
+            web_fetch: Some(Arc::new(WebFetchHandler::from_config(
+                &WebFetchConfig::default(),
+                DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS,
+            ))),
+            code_interpreter: None,
         }
     }
 
@@ -74,6 +94,20 @@ impl GatewayExecutors {
     /// Invalid policy configuration is returned as an error. Connection and
     /// discovery happen when a configured server is requested.
     pub fn from_config(client: Arc<reqwest::Client>, config: &ToolRuntimeConfig) -> Result<Self, ToolError> {
+        config
+            .code_interpreter
+            .validate()
+            .map_err(|error| ToolError::Config(error.to_string()))?;
+        #[cfg(feature = "embedded-code-interpreter")]
+        let code_interpreter = config
+            .code_interpreter
+            .enabled
+            .then(|| CodeInterpreterExecutor::from_config(config.code_interpreter))
+            .transpose()
+            .map(|executor| executor.map(Arc::new))
+            .map_err(|error| ToolError::Config(error.to_string()))?;
+        #[cfg(not(feature = "embedded-code-interpreter"))]
+        let code_interpreter = None;
         let executors = Self {
             mcp: HashMap::new(),
             mcp_configs: config.mcp_servers.clone(),
@@ -89,6 +123,13 @@ impl GatewayExecutors {
                 &config.web_search,
                 config.max_concurrent_gateway_calls,
             ))),
+            web_fetch: config.web_fetch.enabled.then(|| {
+                Arc::new(WebFetchHandler::from_config(
+                    &config.web_fetch,
+                    config.max_concurrent_gateway_calls,
+                )) as Arc<WebFetchExecutor>
+            }),
+            code_interpreter,
         };
         if config.mcp_servers.is_empty() {
             return Ok(executors);
@@ -108,6 +149,7 @@ impl GatewayExecutors {
     pub fn insert(&mut self, registration: impl Into<GatewayExecutorRegistration>) {
         match registration.into() {
             GatewayExecutorRegistration::WebSearch(executor) => self.web_search = Some(executor),
+            GatewayExecutorRegistration::WebFetch(executor) => self.web_fetch = Some(executor),
             GatewayExecutorRegistration::Mcp { server_label, handlers } => {
                 if handlers.is_empty() {
                     tracing::debug!(server_label, "empty MCP discovered handler registration skipped");
@@ -130,9 +172,56 @@ impl GatewayExecutors {
             .unwrap_or_else(|| Arc::new(WebSearchHandler::spec_only()))
     }
 
+    /// The `web_fetch` executor. The one owner of the availability policy: a
+    /// gateway whose operator disabled the executor refuses a native
+    /// declaration here, whether the caller is building a registry or counting
+    /// tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Config`] when the operator disabled the executor.
+    pub fn require_web_fetch(&self) -> Result<Arc<WebFetchExecutor>, ToolError> {
+        self.web_fetch
+            .clone()
+            .ok_or_else(|| ToolError::Config(WEB_FETCH_UNAVAILABLE.to_owned()))
+    }
+
     #[must_use]
     pub(crate) fn request_scoped(&self) -> Self {
         self.clone()
+    }
+
+    /// Validates request declarations against the executors that actually
+    /// completed startup readiness checks.
+    ///
+    /// This runs before request state may be persisted, and again after
+    /// conversation settings are rehydrated, so an inherited declaration
+    /// cannot bypass operator gating.
+    pub(crate) fn validate_declarations(&self, tools: Option<&[ToolDeclaration]>) -> Result<(), ToolError> {
+        let Some(tools) = tools else {
+            return Ok(());
+        };
+        CodeInterpreterHandler::validate_declarations(tools)?;
+        for tool in tools {
+            tool.validate()?;
+        }
+        if tools
+            .iter()
+            .any(|tool| matches!(tool, ToolDeclaration::CodeInterpreter(_)))
+        {
+            let ready = self.code_interpreter.is_some();
+            if !ready {
+                return Err(code_interpreter_unavailable_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the shared, eagerly-ready code interpreter when an operator
+    /// enabled a registered provider.
+    #[must_use]
+    pub(crate) fn code_interpreter_executor(&self) -> Option<Arc<CodeInterpreterExecutor>> {
+        self.code_interpreter.clone()
     }
 
     /// Returns the discovered handlers for one request-declared MCP server.
@@ -298,27 +387,32 @@ fn validate_mcp_execution_options(param: &McpToolParam, configured_server: bool)
 
 impl std::fmt::Debug for GatewayExecutors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GatewayExecutors")
+        let mut debug = f.debug_struct("GatewayExecutors");
+        debug
             .field("mcp_server_handlers", &self.mcp.len())
             .field("mcp_server_configs", &self.mcp_configs.len())
             .field("mcp_clients", &Arc::strong_count(&self.mcp_clients))
             .field("mcp_discovered", &Arc::strong_count(&self.mcp_discovered))
             .field("mcp_allowed_hosts", &self.mcp_allowed_hosts)
             .field("web_search", &self.web_search.is_some())
-            .finish()
+            .field("web_fetch", &self.web_fetch.is_some());
+        debug.field("code_interpreter", &self.code_interpreter.is_some());
+        debug.finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::tool::ToolDeclaration;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::{GatewayExecutorRegistration, GatewayExecutors, validate_mcp_execution_options};
     use crate::config::ToolRuntimeConfig;
+    use crate::tool::ToolError;
     use crate::tool::mcp::McpServerEntry;
     use crate::tool::mcp::{McpDiscoveredHandler, McpHandler};
-    use crate::types::tools::{McpDiscoveredToolParam, McpToolParam};
+    use crate::types::tools::{McpDiscoveredToolParam, McpToolParam, ResponsesTool};
 
     fn mcp_param(value: serde_json::Value) -> McpToolParam {
         serde_json::from_value(value).unwrap()
@@ -392,6 +486,52 @@ mod tests {
 
         let error = validate_mcp_execution_options(&param, false).unwrap_err();
         assert!(error.to_string().contains("connector_id is not supported"));
+    }
+
+    #[test]
+    fn request_validation_rejects_code_interpreter_without_a_ready_executor() {
+        let tools = [ToolDeclaration::from(
+            serde_json::from_value::<ResponsesTool>(serde_json::json!({
+                "type": "code_interpreter",
+                "container": {"type": "auto"}
+            }))
+            .expect("valid declaration"),
+        )];
+
+        let error = GatewayExecutors::default()
+            .validate_declarations(Some(&tools))
+            .expect_err("an unregistered executor must fail closed");
+
+        assert!(matches!(error, ToolError::Config(message) if message.contains("code_interpreter")));
+    }
+
+    #[test]
+    fn from_env_never_registers_the_operator_gated_code_interpreter() {
+        let executors = GatewayExecutors::from_env(Arc::new(reqwest::Client::new()));
+        assert!(executors.code_interpreter_executor().is_none());
+    }
+
+    #[test]
+    fn web_fetch_executor_follows_the_operator_switch() {
+        let client = Arc::new(reqwest::Client::new());
+        assert!(
+            GatewayExecutors::from_env(Arc::clone(&client))
+                .require_web_fetch()
+                .is_ok()
+        );
+        let Err(error) = GatewayExecutors::default().require_web_fetch() else {
+            panic!("a default registry has no web_fetch executor");
+        };
+        assert!(matches!(&error, ToolError::Config(message) if message == super::WEB_FETCH_UNAVAILABLE));
+        let enabled = GatewayExecutors::from_config(Arc::clone(&client), &ToolRuntimeConfig::default()).unwrap();
+        assert!(enabled.require_web_fetch().is_ok());
+        let config = ToolRuntimeConfig {
+            web_fetch: crate::config::WebFetchConfig::default().with_enabled(false),
+            ..ToolRuntimeConfig::default()
+        };
+        let disabled = GatewayExecutors::from_config(client, &config).unwrap();
+        assert!(disabled.require_web_fetch().is_err());
+        assert!(format!("{disabled:?}").contains("web_fetch: false"));
     }
 
     #[tokio::test]

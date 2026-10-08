@@ -1,6 +1,6 @@
 //! Messages connector discovery, upstream declaration normalization, and replay lowering.
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::messages_request::normalize_native_web_search;
+use crate::executor::messages_request::normalize_native_server_tools;
 use crate::types::messages::request::MessagesToolDeclarations;
 use crate::types::messages::{GatewayToolMap, ToolParam};
 use crate::utils::common::serialize_to_value;
@@ -25,15 +25,15 @@ pub async fn prepare_messages_count_tokens(
     }
     let declarations = MessagesToolDeclarations::deserialize(&raw).map_err(ExecutorError::JsonError)?;
     let declared_tools = declarations.tools.as_deref().unwrap_or_default();
-    let mut tools = crate::types::messages::registry_tools(declarations.tools.as_ref(), map);
-    tools.extend(crate::types::messages::mcp::connector_tools(
+    let mut tools = crate::tool::registry_tools(declarations.tools.as_ref(), map);
+    tools.extend(crate::tool::mcp::messages::connector_tools(
         declarations.mcp_servers.as_deref().unwrap_or_default(),
         declared_tools,
     )?);
     let registry = crate::tool::ToolRegistry::build_with_handlers(&mut tools, executors).await?;
     validate_connector_discovery(&registry)?;
     let mut raw = raw;
-    normalize_native_web_search(&mut raw)?;
+    normalize_native_server_tools(&mut raw)?;
     normalize_connector(&mut raw, &tools, &mut map.clone())?;
     Ok(Some(serde_json::to_vec(&raw).map_err(ExecutorError::JsonError)?))
 }
@@ -69,7 +69,7 @@ pub(super) fn validate_connector_discovery(registry: &crate::tool::ToolRegistry)
 
 pub(super) fn normalize_connector(
     raw: &mut Value,
-    tools: &[crate::types::tools::ResponsesTool],
+    tools: &[crate::tool::ToolDeclaration],
     map: &mut GatewayToolMap,
 ) -> ExecutorResult<()> {
     if !has_mcp_state(raw) {
@@ -85,7 +85,6 @@ pub(super) fn normalize_connector(
     let upstream_tools = raw["tools"]
         .as_array_mut()
         .ok_or_else(|| ExecutorError::InvalidRequest("MCP connector requires tools".to_owned()))?;
-    upstream_tools.retain(|tool| tool["type"] != "mcp_toolset");
     let mut has_hosted_search = false;
     for tool in upstream_tools.iter() {
         let tool = ToolParam::deserialize(tool).map_err(ExecutorError::JsonError)?;
@@ -100,12 +99,29 @@ pub(super) fn normalize_connector(
     }
     let mut names = upstream_tools
         .iter()
+        .filter(|tool| tool["type"] != "mcp_toolset")
         .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
         .collect::<std::collections::HashSet<_>>();
-    for param in tools.iter().filter_map(|tool| match tool {
-        crate::types::tools::ResponsesTool::Mcp(param) => Some(param),
-        _ => None,
-    }) {
+    let mut expanded = Vec::new();
+    for declaration in std::mem::take(upstream_tools) {
+        if declaration["type"] != "mcp_toolset" {
+            expanded.push(declaration);
+            continue;
+        }
+        let param = tools
+            .iter()
+            .find_map(|tool| match tool {
+                crate::tool::ToolDeclaration::Mcp(param)
+                    if declaration["mcp_server_name"].as_str() == Some(param.server_label.as_str()) =>
+                {
+                    Some(param)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| ExecutorError::InvalidRequest("MCP toolset has no discovered declaration".to_owned()))?;
+        // One toolset breakpoint belongs at the end of its enabled catalog,
+        // keeping surrounding client tools and other toolsets in their original order.
+        let first = expanded.len();
         for discovered in &param.discovered_tools {
             if !names.insert(discovered.internal_name.clone()) {
                 return Err(ExecutorError::InvalidRequest(
@@ -137,9 +153,20 @@ pub(super) fn normalize_connector(
                 defer_loading: deferred.then_some(true),
                 extra: std::collections::HashMap::default(),
             };
-            upstream_tools.push(serialize_to_value(&tool).map_err(ExecutorError::JsonError)?);
+            expanded.push(serialize_to_value(&tool).map_err(ExecutorError::JsonError)?);
+        }
+        if let Some(cache_control) = declaration.get("cache_control") {
+            if expanded.len() == first {
+                return Err(ExecutorError::InvalidRequest(
+                    "cache_control on an empty MCP toolset has no upstream cache boundary".to_owned(),
+                ));
+            }
+            if let Some(last) = expanded.last_mut() {
+                last["cache_control"] = cache_control.clone();
+            }
         }
     }
+    *upstream_tools = expanded;
     normalize_replayed_mcp(raw, map)
 }
 

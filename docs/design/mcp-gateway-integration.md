@@ -234,13 +234,19 @@ automatically fail the whole Responses request.
 }
 ```
 
-Each server needs a unique name and exactly one toolset. Connector declarations use the same MCP discovery,
+Each server needs a unique name and exactly one toolset. Connector declarations become protocol-neutral
+`ToolDeclaration::Mcp` values and use the same MCP discovery,
 request-scoped registry, typed execution bindings, outbound host allowlist, and credential handling as Responses.
 `authorization_token` supplies the MCP Bearer token; it is removed before inference and redacted in debug output.
 Failed discovery returns an error before inference begins, without exposing remote error details.
 
 Tool-specific `configs` override `default_config` field by field. The defaults are `enabled: true` and
 `defer_loading: false`. Disabled tools are excluded from both the executable registry and upstream declarations.
+Toolsets expand in place, preserving their order relative to client tools and other toolsets. A toolset's
+`cache_control` is retained on its last enabled tool, so one toolset still contributes one cache breakpoint.
+A cache-bearing toolset with no enabled tools is rejected before inference because no equivalent tool boundary
+exists; remove that breakpoint when disabling the whole toolset.
+
 Enabled tools with `defer_loading: true` retain that flag in their normalized Messages function declaration;
 the request must also declare an upstream-hosted Anthropic tool search tool, which cannot itself be deferred.
 The gateway sends the full enabled catalog; an upstream with Anthropic tool search support controls model-context

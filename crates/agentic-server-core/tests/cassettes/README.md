@@ -69,6 +69,27 @@ model requested by Codex 0.149.1. It then runs `scripts/codex_image_smoke.py`, w
 run explicitly advertises text-only and requires the image to be absent. These cases replay the existing Qwen2.5-VL
 single-image SSE recording unchanged; they validate client/catalog propagation, not fresh model inference.
 
+## Messages web fetch cassettes
+
+`messages/messages-web-fetch-Qwen-Qwen3-8B-{nonstreaming,streaming}.yaml` record the upstream turns of a request that
+declared the native `web_fetch_20250910` tool, as the gateway rewrites it: `messages/web_fetch_tools.json` is the
+function tool the gateway sends upstream and `messages/web_fetch_tool_outputs.json` is the `web_fetch_result` the
+gateway produces for the page `tests/messages_web_fetch_cassette_test.rs` serves. The fed-back `tool_result` carries
+`is_error: false`, as the gateway loop's does. Recorded against vLLM-Metal serving Qwen3-8B (4-bit) as `qwen3` with
+`--enable-auto-tool-choice --tool-call-parser hermes` and thinking off:
+
+```bash
+printf 'Fetch http://127.0.0.1:18080/page/release-notes.html with web_fetch and reply with the verification token it contains, nothing else.\n' \
+  | python record_cassette.py --mode messages --turns 2 --no-stream --vllm http://127.0.0.1:5050 --model qwen3 \
+      --tools messages/web_fetch_tools.json --tool-outputs messages/web_fetch_tool_outputs.json \
+      --output messages/messages-web-fetch-Qwen-Qwen3-8B-nonstreaming.yaml
+```
+
+The streaming cassette is the same command with `--stream`. The replay binds an ephemeral port, serves the recorded
+responses with the origin re-based onto it (the streaming `tool_use` input is re-emitted as one `input_json_delta`,
+since the recorded chunks split the URL), and compares the loop's complete upstream requests with the recording,
+normalizing only the origin and `retrieved_at`.
+
 ## Modes
 
 | Mode | Description |
@@ -109,6 +130,8 @@ single-image SSE recording unchanged; they validate client/catalog propagation, 
 --reasoning JSON       JSON object containing Responses reasoning settings
 --input-file FILE       JSON string or item array for turn 1 of an HTTP Responses recording; later turns are prompted
 --max-output-tokens N  max_output_tokens for Responses requests (default 1024; use 0 to omit)
+--max-tool-calls JSON  max_tool_calls per linear Responses turn: an integer for every turn, or an array where null
+                       omits the field on that turn (e.g. '[1, null]')
 --proxy-port PORT      Local proxy port (default 7070)
 --branch-from TURN     Branch from this turn's response id (repeatable)
 --branch-turn-number N First turn number for the corresponding branch (repeatable)
@@ -211,10 +234,20 @@ turns:
     - "data: {...}\n"
 ```
 
+## Persistent multi-agent WebSocket sessions
+
+The multi-agent recorder supports a persistent duplex capture with
+`MULTI_AGENT_TRANSPORT=websocket`. It reuses the HTTP suite's exact prompts and
+tool fixtures, records actual frames in both directions, injects client outputs
+while reading response events, and retains handshake/close/failure evidence.
+See [the multi-agent recording commands and session format](multi_agent/README.md#persistent-websocket-recordings).
+These files use `sessions`, not the HTTP `turns` schema or synthesized SSE.
+
 ## Recorder scripts
 
 | Script | Cassettes | Backend |
 |--------|-----------|---------|
+| `record_multi_agent_cassettes.sh` | Five delegated scenarios over HTTP JSON/SSE or persistent duplex WebSocket | OpenAI and gateway |
 | `record_text_only_cassettes.sh` | 10 text-only cassettes (responses + conv modes, streaming + non-streaming) | OpenAI (`OPENAI_API_KEY`) |
 | `record_conversations_api_cassettes.sh` | 18 Conversation Items API cassettes: four history scenarios in both transports and one non-streaming edge-case sequence, each for both providers | OpenAI and gateway |
 | `record_reasoning_cassettes.sh` | Matching explicit-reasoning cassettes (streaming + non-streaming) | gateway and OpenAI reference; optional direct vLLM |
@@ -224,6 +257,8 @@ turns:
 | `record_shell_cassettes.sh` | Four two-turn local-shell scenarios (streaming + non-streaming) | gateway and OpenAI reference |
 | `record_mcp_cassettes.sh` | Native MCP counter tool discovery and calls (streaming + non-streaming) | gateway and OpenAI reference |
 | `record_web_search_cassettes.sh` | Matching web-search calls (streaming + non-streaming) | gateway and OpenAI reference |
+| `record_max_tool_calls_cassettes.sh` | `max_tool_calls` validation, per-tool exhaustion, call counting, and WebSocket scenarios | gateway and OpenAI reference |
+| `record_code_interpreter_cassettes.sh` | One code-interpreter calculation; OpenAI blocking/SSE and gateway blocking/SSE/WebSocket | gateway and OpenAI reference |
 | `record_messages_tool_choice.py` | Forced `any` and named Messages searches followed by an automatic answer (JSON + SSE) | gateway's upstream traffic to vLLM |
 | `record_image_input_cassettes.sh` | Matching two-turn image-input conversations (streaming + non-streaming) | gateway and OpenAI reference |
 | `record_dynamo_cassettes.sh` | Stateful two-turn and client-executed function tool call cassettes (streaming + non-streaming) | NVIDIA Dynamo frontend |
@@ -403,6 +438,53 @@ GATEWAY_MODEL=Qwen/Qwen3.6-35B-A3B-FP8 \
 bash crates/agentic-server-core/tests/cassettes/record_tool_search_cassettes.sh
 ```
 
+### Code interpreter (OpenAI reference and gateway)
+
+The recorder captures one deterministic calculation in exactly five profiles: OpenAI blocking and HTTP/SSE as the
+wire-contract reference, plus gateway blocking, HTTP/SSE, and Responses WebSocket. Both providers receive the
+`{"type":"code_interpreter","container":{"type":"auto"}}` declaration. The gateway executes generated Python in its
+local Eryx sandbox. The captured requests and responses verify the public declaration and lifecycle across all five
+profiles.
+
+The characterization test requires the OpenAI event names and lifecycle order, folds provider-dependent code-delta
+chunking, checks stable item IDs and output indexes, and rejects events after `response.output_item.done`. It also
+checks blocking/streaming transport parity and that the WebSocket messages exactly match the recorder's synthesized
+SSE. OpenAI currently returns `outputs: null` for the completed call; the gateway intentionally returns its local
+`logs` output containing `CODE_INTERPRETER_OK=385`.
+
+Start an embedded-code-interpreter gateway with a fresh database and the Eryx runtime artifact inside a delegated
+Linux cgroup v2 scope, then record the full matrix. This local recipe requires a running systemd user manager. Every
+selected recording is staged, checked for unmasked authorization data, and semantically validated before it replaces
+a checked-in cassette.
+
+```bash
+install -d -m 700 /tmp/agentic-api-code-interpreter
+
+systemd-run --user --scope --quiet --property=Delegate=yes \
+  bash scripts/tests/with-code-interpreter-cgroup.sh \
+  env ERYX_RUNTIME_CWASM=/path/to/runtime.cwasm \
+    TMPDIR=/tmp/agentic-api-code-interpreter \
+    AGENTIC_CODE_INTERPRETER_ENABLED=true \
+    DATABASE_URL=sqlite:///tmp/agentic_api_code_interpreter_matrix.db \
+    cargo run -p agentic-server --features embedded-code-interpreter -- \
+      --gateway-host 127.0.0.1 \
+      --gateway-port 3098 \
+      --llm-api-base http://127.0.0.1:8000 \
+      --skip-llm-ready-check
+```
+
+```bash
+OPENAI_API_KEY=sk-... \
+CODE_INTERPRETER_RECORD_SET=all \
+OPENAI_MODEL=gpt-5.6 \
+GATEWAY_URL=http://127.0.0.1:3098 \
+GATEWAY_MODEL=Qwen/Qwen3.6-35B-A3B \
+bash crates/agentic-server-core/tests/cassettes/record_code_interpreter_cassettes.sh
+```
+
+Use `CODE_INTERPRETER_RECORD_SET=openai-reference`, `gateway-nonstreaming`, `gateway-streaming`,
+`gateway-websocket`, or `gateway` to refresh only that part of an existing five-profile matrix.
+
 ### Web search (gateway and OpenAI)
 
 The default records both providers. Use `WEB_SEARCH_RECORD_SET=gateway` or
@@ -412,6 +494,28 @@ The default records both providers. Use `WEB_SEARCH_RECORD_SET=gateway` or
 OPENAI_API_KEY=sk-... \
 bash crates/agentic-server-core/tests/cassettes/record_web_search_cassettes.sh
 ```
+
+### `max_tool_calls` (OpenAI reference and gateway)
+
+The recorder captures four groups per provider for [#398](https://github.com/vllm-project/agentic-api/issues/398):
+`validation` (JSON only; every accepted and rejected value), `builtin` and `counting` (JSON and SSE; web search,
+code interpreter, and MCP exhaustion, client-executed calls, and continuations), and `websocket`. Each leg is an
+independent conversation appended with `--append`; the script header lists the legs and what each isolates. The
+gateway recordings show the gateway enforcing the limit against a local You.com-compatible search stub
+(`YOU_API_BASE_URL`), so their search results are synthetic.
+
+```bash
+OPENAI_API_KEY=sk-... \
+bash crates/agentic-server-core/tests/cassettes/record_max_tool_calls_cassettes.sh
+
+MAX_TOOL_CALLS_RECORD_SET=gateway GATEWAY_URL=http://localhost:9000 GATEWAY_MODEL=Qwen/Qwen3.6-35B-A3B \
+MAX_OUTPUT_TOKENS=16384 MAX_TOOL_CALLS_SKIP_LEGS="mixed-builtin mcp-failure mcp-then-search" \
+bash crates/agentic-server-core/tests/cassettes/record_max_tool_calls_cassettes.sh
+```
+
+`MAX_TOOL_CALLS_RECORD_SET` selects `openai` (default), `gateway`, or `all`; `MAX_TOOL_CALLS_GROUPS` selects
+groups; `MAX_TOOL_CALLS_SKIP_LEGS` omits legs a provider cannot run. The gateway `code-interpreter` legs need the
+embedded-code-interpreter gateway described above.
 
 ### Image input (gateway → vLLM vision model, and OpenAI)
 

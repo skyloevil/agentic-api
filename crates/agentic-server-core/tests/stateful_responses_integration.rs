@@ -13,7 +13,8 @@ use agentic_core::storage::InOutItem;
 use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
 use agentic_core::types::tools::{FunctionToolParam, NonEmptyToolName};
 use agentic_core::{
-    FunctionToolResultMessage, InputItem, OutputItem, ReasoningOutput, ResponsesInput, ResponsesTool, ToolChoice,
+    FunctionToolResultMessage, InputItem, OpaqueReasoning, OutputItem, ReasoningOutput, ReasoningStatus,
+    ResponsesInput, ResponsesTool, ToolChoice,
 };
 use either::Either;
 use futures::StreamExt;
@@ -985,6 +986,7 @@ async fn tool_search_store_false_manual_replay_completes_without_reusable_respon
     assert_eq!(output_text(&final_response), "manual replay complete");
 
     let lookup_ctx = RequestContext {
+        multi_agent_tree: None,
         original_request: make_request("lookup", true, false, Some(final_response.id.clone()), None),
         enriched_request: make_request("lookup", true, false, Some(final_response.id), None),
         new_input_items: Vec::new(),
@@ -1044,6 +1046,7 @@ async fn test_previous_response_id_persists_inherited_tools_and_choice() {
     assert_eq!(output_text(&p2), "follow up answer");
 
     let lookup_ctx = RequestContext {
+        multi_agent_tree: None,
         original_request: RequestPayload {
             previous_response_id: Some(p2.id.clone()),
             ..second_request
@@ -1388,10 +1391,13 @@ async fn assert_plaintext_reasoning_replay(stream: bool, conversation: bool, opa
     assert_eq!(stored.content.len(), 2);
     assert_eq!(stored.content[0].text, "");
     assert_eq!(stored.content[1].text, "plaintext continuation");
-    assert_eq!(stored.summary[0]["text"], "public summary");
-    let expected_state = opaque_state.then(|| serde_json::json!("opaque-provider-state"));
-    assert_eq!(stored.encrypted_content, expected_state);
-    assert_eq!(stored.status.as_deref(), Some("completed"));
+    assert_eq!(stored.summary[0].text, "public summary");
+    let expected_state = opaque_state.then_some("opaque-provider-state");
+    assert_eq!(
+        stored.encrypted_content.as_ref().map(OpaqueReasoning::as_str),
+        expected_state
+    );
+    assert_eq!(stored.status, Some(ReasoningStatus::Completed));
 }
 
 async fn assert_summary_only_reasoning_not_replayed(stream: bool, conversation: bool) {
@@ -1466,9 +1472,9 @@ async fn assert_summary_only_reasoning_not_replayed(stream: bool, conversation: 
     };
     let stored = persisted_reasoning(&history);
     assert!(stored.content.is_empty());
-    assert_eq!(stored.summary[0]["text"], "public summary");
+    assert_eq!(stored.summary[0].text, "public summary");
     assert_eq!(stored.encrypted_content, None);
-    assert_eq!(stored.status.as_deref(), Some("completed"));
+    assert_eq!(stored.status, Some(ReasoningStatus::Completed));
 }
 
 async fn run_response(
@@ -1487,6 +1493,7 @@ async fn run_response(
 fn lookup_context(previous_response_id: Option<String>, conversation_id: Option<String>) -> RequestContext {
     let request = make_request("lookup", true, false, previous_response_id, conversation_id);
     RequestContext {
+        multi_agent_tree: None,
         enriched_request: request.clone(),
         original_request: request,
         new_input_items: Vec::new(),

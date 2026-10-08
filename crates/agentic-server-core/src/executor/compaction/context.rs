@@ -31,6 +31,9 @@ pub(super) fn item_has_meaningful_context(item: &InputItem) -> bool {
             }),
         },
         InputItem::FunctionCall(call) => !call.name.trim().is_empty() || !call.arguments.trim().is_empty(),
+        InputItem::CodeInterpreterCall(call) => {
+            !call.code.trim().is_empty() || call.outputs.as_ref().is_some_and(|outputs| !outputs.is_empty())
+        }
         InputItem::FunctionCallOutput(output) => output.output.has_content(),
         InputItem::ToolSearchCall(call) => !call.call_id.trim().is_empty() || value_has_content(&call.arguments),
         InputItem::ToolSearchOutput(output) => !output.call_id.trim().is_empty() || !output.tools.is_empty(),
@@ -40,10 +43,20 @@ pub(super) fn item_has_meaningful_context(item: &InputItem) -> bool {
         InputItem::ShellCallOutput(output) => !output.output.is_empty(),
         InputItem::Reasoning(reasoning) => {
             reasoning.content.iter().any(|content| !content.text.trim().is_empty())
-                || reasoning.summary.iter().any(value_has_content)
-                || reasoning.encrypted_content.as_ref().is_some_and(value_has_content)
+                // Preserve the previous JSON policy: even an empty summary part
+                // carried its nonempty `summary_text` discriminator.
+                || !reasoning.summary.is_empty()
+                || reasoning
+                    .encrypted_content
+                    .as_ref()
+                    .is_some_and(|state| !state.as_str().trim().is_empty())
         }
         InputItem::Compaction(compaction) => !compaction.encrypted_content.trim().is_empty(),
-        InputItem::McpListTools(_) | InputItem::CompactionTrigger | InputItem::Unknown => false,
+        InputItem::MultiAgentCall(_)
+        | InputItem::MultiAgentCallOutput(_)
+        | InputItem::AgentMessage(_)
+        | InputItem::McpListTools(_)
+        | InputItem::CompactionTrigger
+        | InputItem::Unknown => false,
     }
 }

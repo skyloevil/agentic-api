@@ -8,7 +8,7 @@
 
 **The stateful, agentic API layer for [vLLM](https://github.com/vllm-project/vllm), written in Rust 🦀**
 
-*Run OpenAI-grade agentic workloads (Responses API, server-side tools, Codex) on your own GPUs.*
+*Run OpenAI-grade agentic workloads (Responses and Messages APIs, server-side tools, Codex, Claude Code) on your own GPUs.*
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?logo=rust)](Cargo.toml)
@@ -27,14 +27,14 @@ vLLM gives you state-of-the-art inference throughput. But real agentic applicati
 
 ```mermaid
 flowchart LR
-    C(["🧑‍💻 Client<br/>Codex · SDKs · curl"]) -->|"📮 <code>POST /v1/responses</code><br/>🌐 HTTP&nbsp;&nbsp;📡 SSE&nbsp;&nbsp;🔌 WebSocket"| A
+    C(["🧑‍💻 Client<br/>Codex · Claude Code · SDKs · curl"]) -->|"📮 <code>POST /v1/responses</code> · <code>/v1/messages</code><br/>🌐 HTTP&nbsp;&nbsp;📡 SSE&nbsp;&nbsp;🔌 WebSocket"| A
     subgraph A ["⚡ Agentic API (Rust 🦀)"]
         direction TB
         S["🔄 State hydration<br/><code>previous_response_id</code>"]
-        T["🛠️ Server-side tools<br/>web search · functions"]
-        P["💾 Persistence<br/>SQLite response store"]
+        T["🛠️ Server-side tools<br/>web search · web fetch · MCP · code interpreter"]
+        P["💾 Persistence<br/>SQLite · PostgreSQL"]
     end
-    A -->|"🚀 <code>POST /v1/responses</code><br/>⚙️ stateless&nbsp;&nbsp;🤝 OpenAI-compatible"| V(["🚀 vLLM core<br/>inference engine"])
+    A -->|"🚀 <code>POST /v1/responses</code> · <code>/v1/messages</code><br/>⚙️ stateless&nbsp;&nbsp;🤝 OpenAI/Anthropic-compatible"| V(["🚀 vLLM core<br/>inference engine"])
 
     classDef client fill:#FFE8B3,stroke:#F59E0B,stroke-width:2px,color:#7C2D12
     classDef inner fill:#E0E7FF,stroke:#6366F1,stroke-width:2px,color:#312E81
@@ -53,12 +53,14 @@ flowchart LR
 
 ## ✨ Key Features
 
-- 🔄 **Stateful conversations**: the server manages history via `previous_response_id`. No client-side message tracking, no replaying full transcripts.
-- 🛠️ **Server-side tool execution**: an explicit tool-ownership model (gateway / client / provider) decides exactly what runs where. Web search ships today via [You.com](https://you.com), [Brave Search](https://brave.com/search/api/), or [Tavily](https://tavily.com), and the model executes multi-step tool chains automatically.
-- 📡 **Every transport**: non-streaming HTTP, server-sent events for token streaming, and full **WebSocket** support for interactive clients.
-- 🧰 **Codex-ready**: accepts Codex-shaped Responses traffic out of the box, preserving the tool declarations and response item shapes Codex depends on.
-- 🏃 **Background execution**: fire-and-forget requests that keep processing server-side.
-- ✅ **Compatibility tested**: validated against the [Open Responses](https://www.openresponses.org/) compatibility suite, with replay-cassette tests for real OpenAI and vLLM traffic.
+- 🔄 **Stateful conversations**: the server manages history via `previous_response_id` or the [Conversations API](#-api-surface). No client-side message tracking, no replaying full transcripts.
+- 🛠️ **Server-side tool execution**: an explicit tool-ownership model (gateway / client / provider) decides exactly what runs where. Web search ships today via [You.com](https://you.com), [Brave Search](https://brave.com/search/api/), [Tavily](https://tavily.com), or a self-hosted [SearXNG](https://docs.searxng.org/) instance, alongside MCP tools and an opt-in [embedded code interpreter](#optional-embedded-code-interpreter); the model executes multi-step tool chains automatically.
+- 🤝 **Multi-agent orchestration**: a stored Responses request can spawn and coordinate subagents server-side over HTTP, returning their attributed work in one response ([details](#-multi-agent-responses)).
+- 📡 **Every transport**: non-streaming HTTP, server-sent events for token streaming, and full **WebSocket** support for interactive clients, with `stream_id` multiplexing.
+- 🧰 **Codex and Claude Code ready**: accepts Codex-shaped Responses traffic and Anthropic Messages traffic, preserving the tool declarations and item shapes each client depends on.
+- 🗜️ **Compaction**: automatic and explicit context compaction through `/v1/responses/compact` ([guide](docs/guides/responses-compaction.md)).
+- 🔭 **Observability**: opt-in OpenTelemetry traces and metrics over OTLP ([guide](docs/deploying/observability.md)).
+- ✅ **Compatibility tested**: validated against the [Open Responses](https://www.openresponses.org/) compatibility suite, with replay-cassette tests for real OpenAI, vLLM, SGLang, and NVIDIA Dynamo traffic.
 
 ## 🧭 API Surface
 
@@ -67,11 +69,17 @@ flowchart LR
 | `POST /v1/responses` | OpenAI-compatible Responses API with state, tools, and streaming | ✅ |
 | `GET /v1/responses/{response_id}` | Retrieve a locally stored response | ✅ |
 | `GET /v1/responses` | WebSocket transport for the Responses API | ✅ |
-| `POST /v1/conversations` | Conversation management | ✅ |
+| `POST /v1/responses/compact` | Compact direct input or a stored response chain | ✅ |
+| `/v1/conversations` · `/v1/conversations/{id}/items` | Conversations API: create, retrieve, update, and delete conversations and their items | ✅ |
+| `POST /v1/messages` · `POST /v1/messages/count_tokens` | Anthropic Messages API forwarded to the upstream, with a server-side loop for gateway-owned tools | ✅ |
 | `GET /v1/models` | Model listing proxied from vLLM | ✅ |
+| `POST /v1/chat/completions` · `POST /v1/completions` | Forwarded to the upstream verbatim, so clients on those endpoints keep working when the gateway is the entry point | ✅ |
 | `GET /health` · `GET /ready` | Liveness and readiness probes | ✅ |
-| Messages API | Anthropic-style stateful messages on shared primitives | 🚧 Planned |
+| `GET /swagger-ui` · `GET /openapi.json` | Generated OpenAPI spec and Swagger UI, served when `ENABLE_OPENAPI_DOCS=true` | ✅ |
+| Stateful Messages | Messages continuation on the shared persistence primitives | ⏳ Planned |
 | Interactions API | Higher-level agentic workflow surface | ⏳ Planned |
+
+See the [API reference](docs/api/index.md) for routing, authentication, and WebSocket details.
 
 Responses created with `store: true` retain a terminal snapshot for retrieval, including status, usage,
 and this turn's output. Retrieval does not call the upstream model. Unknown IDs return a JSON `404`;
@@ -110,6 +118,9 @@ model the upstream lists at `/v1/models`; pass `--model` to choose a different o
   --model Qwen/Qwen3-30B-A3B-FP8
 ```
 
+For self-hosted Claude Code setup—including models that Claude Code does not recognize in its own catalog—see
+[Configure Claude Code with a self-hosted model](docs/guides/harness-cli-testing.md#claude-code-with-a-self-hosted-model).
+
 SQLite is the default storage backend. Use PostgreSQL explicitly when the session is shared:
 
 ```bash
@@ -133,24 +144,24 @@ permission checks and disables Codex approvals and sandboxing.
 
 ### Python distribution
 
-The `agentic-api` Python package is [available on PyPI](https://pypi.org/project/agentic-api/0.8.0/). Version 0.8.0
+The `agentic-api` Python package is [available on PyPI](https://pypi.org/project/agentic-api/0.9.0/). Version 0.9.0
 includes the Rust gateway, the `agentic` CLI, and a small Python launcher. Prebuilt wheels support Linux x86_64
 (glibc 2.17 or newer), macOS Intel, and macOS Apple Silicon; Python 3.10 or newer is required.
 
 With uv installed, run the packaged Rust CLI without a global installation:
 
 ```bash
-uvx --from agentic-api==0.8.0 agentic --version
-uvx --from agentic-api==0.8.0 agentic serve --upstream http://existing-vllm:8000
+uvx --from agentic-api==0.9.0 agentic --version
+uvx --from agentic-api==0.9.0 agentic serve --upstream http://existing-vllm:8000
 ```
 
 Or install the Python launcher, with the optional local inference runtime:
 
 ```bash
-python -m pip install agentic-api==0.8.0
+python -m pip install agentic-api==0.9.0
 agentic-api serve --vllm-base-url http://existing-vllm:8000
 
-python -m pip install "agentic-api[local]==0.8.0"
+python -m pip install "agentic-api[local]==0.9.0"
 agentic-api serve --model MODEL_ID
 ```
 
@@ -165,10 +176,10 @@ script needs machine-readable diagnostics.
 Use uv to install the published package or run the Python launcher without a global installation:
 
 ```bash
-uv pip install agentic-api==0.8.0
-uv pip install "agentic-api[local]==0.8.0"
-uvx --from agentic-api==0.8.0 agentic-api doctor
-uvx --from agentic-api==0.8.0 agentic-api serve --vllm-base-url http://existing-vllm:8000
+uv pip install agentic-api==0.9.0
+uv pip install "agentic-api[local]==0.9.0"
+uvx --from agentic-api==0.9.0 agentic-api doctor
+uvx --from agentic-api==0.9.0 agentic-api serve --vllm-base-url http://existing-vllm:8000
 ```
 
 The Rust-native `agentic` CLI remains supported for `run codex`, `run claude`, `serve`, and `validate`. For the full
@@ -181,7 +192,8 @@ Qwen3.8-27B's vLLM chat template accepts `low`, `medium`, and `xhigh` reasoning 
 default `high`. Override the pinned value with `AGENTIC_CLAUDE_EFFORT`. See the [Claude Code effort
 configuration](https://code.claude.com/docs/en/model-config) and [vLLM reasoning output
 documentation](https://docs.vllm.ai/en/latest/features/reasoning_outputs/) for the underlying behavior, and
-[Harness CLI Testing](docs/guides/harness-cli-testing.md) for an end-to-end verification checklist.
+[Harness CLI Testing](docs/guides/harness-cli-testing.md) for an end-to-end verification checklist and the
+[self-hosted Claude Code configuration](docs/guides/harness-cli-testing.md#claude-code-with-a-self-hosted-model).
 
 **1. Serve a model with vLLM.** Any recipe from [recipes.vllm.ai](https://recipes.vllm.ai) works:
 
@@ -219,6 +231,13 @@ AGENTIC_WEB_SEARCH_PROVIDER=tavily TAVILY_API_KEY=<your-tavily-api-key> \
   cargo run -p agentic-server -- --llm-api-base http://0.0.0.0:5050
 ```
 
+Or your own [SearXNG](https://docs.searxng.org/) instance, which needs no API key -- only its URL:
+
+```bash
+AGENTIC_WEB_SEARCH_PROVIDER=searxng AGENTIC_WEB_SEARCH_BASE_URL=http://127.0.0.1:8080 \
+  cargo run -p agentic-server -- --llm-api-base http://0.0.0.0:5050
+```
+
 The default database is `~/.agentic-api/agentic_api.db`, so running an installed binary does not create state in the
 current directory. Set `AGENTIC_API_HOME` to an absolute directory to move both the default database and user
 configuration, or set `DATABASE_URL`/`--db-url` to select a different database.
@@ -252,13 +271,22 @@ llm_api_base = "http://127.0.0.1:5050"
 # database_url = "postgresql://agentic-api@localhost/agentic_api"
 
 [web_search]
-# Search backend for the gateway-owned web_search tool: "you" (default), "brave", or "tavily".
+# Search backend for the gateway-owned web_search tool: "you" (default), "brave", "tavily", or "searxng".
 provider = "you"
 base_url = "https://api.ydc-index.io"
 api_key_env = "YOU_API_KEY"
 # Concurrent provider requests inside one batched web-search call; unset uses
-# the provider default (Brave: 1; You.com and Tavily: max_concurrent_gateway_calls).
+# the provider default (Brave: 1; You.com, Tavily and SearXNG: max_concurrent_gateway_calls).
 # max_concurrent_queries = 1
+
+[web_fetch]
+# Gateway-executed page fetches for Claude's native web_fetch_20250910 tool on /v1/messages.
+# enabled = true
+# Allow fetches of private, loopback, and other non-public addresses (off by default).
+# allow_private_networks = false
+# Download ceiling per fetch in bytes and time ceiling per fetch in seconds.
+# max_response_bytes = 10485760
+# timeout_secs = 20
 
 [mcp]
 allowed_hosts = ["mcp.example.com"]
@@ -324,8 +352,8 @@ parsed. Order of precedence is `--max-request-body-size-bytes`, then `AGENTIC_MA
 file setting.
 
 `api_key_env` names the process environment variable containing the web-search credential; it does not contain the
-credential itself. When it is unset, the selected provider's conventional variable is read (`YOU_API_KEY` or
-`BRAVE_API_KEY`). Newly generated files leave `api_key_env` unset so changing providers also changes the default
+credential itself. When it is unset, the selected provider's conventional variable is read (`YOU_API_KEY`,
+`BRAVE_API_KEY`, or `TAVILY_API_KEY`). Newly generated files leave `api_key_env` unset so changing providers also changes the default
 credential variable. `AGENTIC_WEB_SEARCH_PROVIDER`, `AGENTIC_WEB_SEARCH_BASE_URL`, `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES`,
 `AGENTIC_MCP_ALLOWED_HOSTS`, `AGENTIC_MAX_REQUEST_BODY_SIZE_BYTES`, and `AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS` can
 override their typed file settings; `YOU_API_BASE_URL` is still honored as the endpoint override when the provider is
@@ -366,9 +394,9 @@ every provider.
 | Setting | Environment variable | `config.toml` key | Default |
 | :--- | :--- | :--- | :--- |
 | Provider | `AGENTIC_WEB_SEARCH_PROVIDER` | `[web_search] provider` | `you` |
-| API key | variable named by `api_key_env` | `[web_search] api_key_env` | `YOU_API_KEY` / `BRAVE_API_KEY` / `TAVILY_API_KEY` |
-| Endpoint | `AGENTIC_WEB_SEARCH_BASE_URL` (or `YOU_API_BASE_URL` for You.com) | `[web_search] base_url` | none for You.com; `https://api.search.brave.com` for Brave; `https://api.tavily.com` for Tavily |
-| Concurrent queries | `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` | `[web_search] max_concurrent_queries` | You.com and Tavily inherit `max_concurrent_gateway_calls`; Brave `1` |
+| API key | variable named by `api_key_env` | `[web_search] api_key_env` | `YOU_API_KEY` / `BRAVE_API_KEY` / `TAVILY_API_KEY` / `SEARXNG_API_KEY` (optional) |
+| Endpoint | `AGENTIC_WEB_SEARCH_BASE_URL` (or `YOU_API_BASE_URL` for You.com) | `[web_search] base_url` | none for You.com; `https://api.search.brave.com` for Brave; `https://api.tavily.com` for Tavily; **required** for SearXNG |
+| Concurrent queries | `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` | `[web_search] max_concurrent_queries` | You.com, Tavily and SearXNG inherit `max_concurrent_gateway_calls`; Brave `1` |
 
 **You.com** (`provider = "you"`) is the default and behaves exactly as before: domain filters are applied by the
 provider, `count` accepts 1–100, and the You.com-specific `livecrawl`, `livecrawl_formats`, `crawl_timeout`, and
@@ -425,6 +453,48 @@ provider = "tavily"
 api_key_env = "TAVILY_API_KEY"
 ```
 
+**SearXNG** (`provider = "searxng"`) runs against a [self-hosted SearXNG](https://docs.searxng.org/admin/installation.html)
+instance: the gateway only ever sends an HTTP request to that instance, no API key is needed, and no search vendor
+sees your deployment. Note that SearXNG itself forwards each query to the engines enabled in its `settings.yml`, so
+for a fully air-gapped setup restrict it to internal or offline engines. This does **not** cover SearXNG's "bang"
+syntax (`!!g rust`, `!ddg rust`, and its thousands of other pinned bangs): a bang makes SearXNG redirect straight to
+the named external engine without consulting the enabled-engines list at all, before it even looks at
+`format=json`. The gateway's SearXNG client disables HTTP redirects specifically so a bang in the query — written
+by the model, requested by the user, or picked up from a page the model read — fails that `web_search_call` instead
+of silently sending it past the configured instance. The endpoint is mandatory: the server refuses to start when
+`searxng` is selected without `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` (an absolute `http(s)` URL
+without a query or fragment; a sub-path such as `http://host/searxng` is fine). Two instance settings matter:
+
+- The JSON output format must be enabled: add `json` to `search.formats` in SearXNG's `settings.yml`
+  (`formats: [html, json]`). Without it SearXNG answers `403`, which the failed `web_search_call` explains.
+- If the instance runs with `server.limiter: true` (the default in the official `searxng-docker` template), its bot
+  detection rejects requests that lack `Accept-Encoding: gzip`, which the gateway deliberately never sends. Add the
+  gateway's address to `botdetection.ip_lists.pass_ip` in `limiter.toml`, or disable the limiter for an internal
+  instance; otherwise every search fails with `429`.
+
+The gateway adapts the shared tool contract to SearXNG:
+
+- Web and news results come from one `categories=general,news` request per query, split by each hit's category.
+- `allowed_domains` / `blocked_domains` (and the model's `include_domains` / `exclude_domains`) are enforced by the
+  gateway after the response arrives; `count` is applied by the gateway after filtering, since SearXNG has no
+  result-count parameter. Without `count` or `search_context_size` every hit the instance returned is passed on.
+- `freshness` maps to `time_range=day|week|month|year`; a `YYYY-MM-DDtoYYYY-MM-DD` range has no SearXNG equivalent
+  and is ignored. `language` is normalized to SearXNG's `xx` / `xx-YY` form (`zh-Hans` becomes `zh`); `safesearch`
+  maps to `0` / `1` / `2`.
+- `country` and the You.com-specific arguments are ignored (logged at debug level).
+- Each per-query `metadata[]` entry carries `"provider": "searxng"`.
+- Concurrency inherits `max_concurrent_gateway_calls`; lower `max_concurrent_queries` for a small instance. Rate
+  limits (`429`) fail that `web_search_call` without an automatic retry.
+
+If the instance sits behind an authenticating reverse proxy, set `SEARXNG_API_KEY` (or the variable named by
+`api_key_env`) and the gateway sends it as a `Bearer` token. Example:
+
+```toml
+[web_search]
+provider = "searxng"
+base_url = "http://searxng.internal:8080"
+```
+
 Restrict the file to the service account (for example, `chmod 600 ~/.agentic-api/config.toml`), especially if you add
 credentialed `database_url`, MCP headers, or stdio MCP environment values. Prefer `DATABASE_URL`, referenced API-key
 environment variables, and a deployment secret manager for secrets.
@@ -441,6 +511,40 @@ To use an operator-configured MCP server, declare its label without sending its 
 Configured `allowed_tools` form the maximum tool set; request-provided `allowed_tools` may narrow it. A configured
 `require_approval = "never"` lets requests omit that field. If a label exists in `config.toml`, a request cannot
 override it with `server_url`; otherwise the existing request-declared HTTP MCP flow remains available.
+
+### Optional embedded code interpreter
+
+The Eryx code interpreter is excluded from default builds. To opt in from source, prepare the platform-specific Eryx 0.8 runtime and then enable the Cargo feature:
+
+```bash
+./scripts/setup-eryx-runtime.sh
+cargo build --release -p agentic-server --features embedded-code-interpreter
+```
+
+The setup script installs the `eryx-precompile` version matching `Cargo.lock` when needed and prepares Eryx's cached runtime. During the Cargo build, Eryx finds that `runtime.cwasm`, copies it into Cargo's build output, and embeds it in the server binary. `ERYX_RUNTIME_CWASM=/absolute/path/to/runtime.cwasm` is only needed to select an artifact outside the cache; it does not build the artifact and is not needed when running the resulting binary.
+
+Enable the compiled executor in `~/.agentic-api/config.toml`:
+
+```toml
+[code_interpreter]
+enabled = true
+```
+
+Alternatively, set `AGENTIC_CODE_INTERPRETER_ENABLED=true`, which takes precedence over the file. The Cargo feature and the runtime setting are both required. When `TMPDIR` is unset, the interpreter creates a private `tmp` directory under `AGENTIC_API_HOME` (default `~/.agentic-api`). An explicit `TMPDIR` overrides that location.
+
+Run the server normally; no wrapper script is needed:
+
+```bash
+cargo run --release -p agentic-server --bin agentic-server \
+  --features embedded-code-interpreter -- --llm-api-base http://127.0.0.1:5050
+# Or use the feature-enabled binary built above:
+./target/release/agentic-server --llm-api-base http://127.0.0.1:5050
+```
+
+On Linux, startup reuses an existing delegated cgroup or automatically requests a transient scope through `systemd-run --user`. It creates a gateway leaf before starting runtime threads, allowing isolated workers to enforce their memory and process limits. This requires cgroup v2 with `memory` and `pids` controllers and either a running systemd user manager or a service configured with `Delegate=yes`. Startup fails if containment cannot be established.
+
+See the [embedded code interpreter design](docs/design/embedded-code-interpreter.md) for resource limits, request
+shape, containment limitations, and feature-enabled verification.
 
 ## 🤖 Codex on your own GPUs
 
@@ -524,8 +628,8 @@ Claude Code's own tools (Bash, Edit, Read, …) stay **client-owned** — Claude
 
 Current Claude Code versions declare Anthropic's native `web_search_20250305` server tool. Agentic API translates that
 declaration for the upstream model and executes the resulting search server-side against the configured search backend
-(You.com, Brave Search, or Tavily, see [Web search providers](#web-search-providers)); no MCP server or tool alias is
-required:
+(You.com, Brave Search, Tavily, or SearXNG, see [Web search providers](#web-search-providers)); no MCP server or tool
+alias is required:
 
 ```bash
 YOU_API_KEY=<you.com-key> YOU_API_BASE_URL=<you.com-base-url> \
@@ -536,6 +640,10 @@ The gateway supports the basic `web_search_20250305` contract, including `max_us
 `blocked_domains`, and the country in `user_location`. Other versioned native web-search declarations are rejected rather
 than forwarded in a shape the upstream cannot execute.
 
+`max_uses` limits the searches performed across the whole request, not the number of tool calls. The model may batch
+several queries into one call, and every query counts as one search. A call that the remaining budget cannot cover is
+not run, and the model is told the limit was reached; a later call that fits still runs.
+
 Older clients that declare a function tool named `WebSearch` can still opt in with
 `MESSAGES_GATEWAY_TOOL_ALIASES="WebSearch=web_search"`. This variable maps a client tool name to a gateway executor
 (`name=executor`, comma-separated) and remains empty by default. The gateway adapts the older `WebSearch` function's
@@ -543,25 +651,116 @@ Older clients that declare a function tool named `WebSearch` can still opt in wi
 
 > Note: allow and block domain lists are mutually exclusive, matching Anthropic's native tool contract.
 
+### Fetching pages with the native web fetch tool
+
+Applications that call the Messages API through the Anthropic SDK can declare Claude's native
+[`web_fetch_20250910`](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool) server tool. Agentic
+API rewrites that declaration into an ordinary function tool for the upstream model, fetches the page itself when the
+model calls it, hands the page text back to the model, and keeps the call out of the client-visible response: the same
+hide-the-call contract as web search. `/v1/messages/count_tokens` accepts the declaration too. No search provider or API
+key is involved; the built-in fetcher is on by default and can be switched off with `[web_fetch] enabled = false` or
+`AGENTIC_WEB_FETCH_ENABLED=false`, after which such a declaration is rejected with HTTP 400 instead of being forwarded
+in a shape the upstream cannot execute.
+
+```json
+{
+  "tools": [
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 5,
+     "allowed_domains": ["example.com"], "max_content_tokens": 20000}
+  ]
+}
+```
+
+The gateway supports `max_uses`, `allowed_domains` / `blocked_domains` (matched on the host only, as Anthropic documents
+for web fetch, so each entry must be a host name or address without scheme or path), and `max_content_tokens`;
+`citations: {"enabled": false}` and `allowed_callers: ["direct"]` are accepted. Anything the gateway cannot honour
+(`citations` enabled, the `use_cache` and `response_inclusion` settings of later tool versions, or another
+`web_fetch_*` version) is rejected with HTTP 400 rather than ignored.
+
+Each call answers the model with one JSON `tool_result`: the final URL after redirects, the page title, the content
+type, a `retrieved_at` timestamp, and the page text. HTML is reduced to plain text; `text/*`, XHTML, XML, and JSON
+bodies are returned as text; PDF and other binary types are refused. `max_content_tokens` is applied as an approximate
+budget of four bytes per token, and the text is always cut below the gateway's 1 MiB tool output cap. A fetch that
+cannot be served answers the model with the documented
+[error codes](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool#errors) in an error
+`tool_result` (`url_not_accessible`, `url_not_allowed`, `too_many_requests`, `unsupported_content_type`, `url_too_long`,
+`invalid_tool_input`, `max_uses_exceeded`, `url_not_in_prior_context`, `unavailable`), so the turn continues.
+
+Fetches are bounded and never reach internal networks:
+
+- Only a URL that already appeared in the conversation can be fetched: in a user message, a client `tool_result`, or a
+  gateway web search or fetch result, and only as that whole URL, not as the prefix of a longer one. A URL the model
+  produced itself, or one that appears only in the system prompt, is refused with `url_not_in_prior_context`, matching
+  Anthropic's rule.
+- Only absolute `http`/`https` URLs of at most 250 characters without embedded credentials are accepted.
+- Hosts that are, or resolve to, loopback, private, link-local (including cloud metadata), carrier-grade NAT, multicast,
+  or other non-public addresses are refused before any connection; the connection is pinned to the addresses that
+  passed the check, and every redirect hop is checked again with the same rules and domain filters. Under this policy
+  the fetcher connects directly and ignores the `HTTP_PROXY` / `HTTPS_PROXY` environment, so the check and the pin
+  apply to the real destination. Deployments that fetch intranet pages on purpose can set
+  `[web_fetch] allow_private_networks = true`, which also restores proxy use.
+- Each fetch is bounded in time (`timeout_secs`, default 20 s including redirects), size (`max_response_bytes`,
+  default 10 MiB; a longer body is cut and reported as truncated), and redirects (5 hops).
+- `max_uses` is a request-wide budget of fetches. Every admitted call is charged whether the page arrives, the fetch
+  fails, or the URL is refused; a call whose arguments carry no URL is answered as invalid input without being charged.
+- At most `max_concurrent_gateway_calls` fetches (default 5) are in flight at once across the gateway; a round that
+  asks for more waits for a slot.
+
+| Setting | Environment variable | `config.toml` key | Default |
+| :--- | :--- | :--- | :--- |
+| Enabled | `AGENTIC_WEB_FETCH_ENABLED` | `[web_fetch] enabled` | `true` |
+| Private networks | `AGENTIC_WEB_FETCH_ALLOW_PRIVATE_NETWORKS` | `[web_fetch] allow_private_networks` | `false` |
+| Download ceiling | `AGENTIC_WEB_FETCH_MAX_RESPONSE_BYTES` | `[web_fetch] max_response_bytes` | `10485760` |
+| Time ceiling | `AGENTIC_WEB_FETCH_TIMEOUT_SECS` | `[web_fetch] timeout_secs` | `20` |
+
+Claude Code is unaffected: its `WebFetch` is a client tool with its own schema that Claude Code runs locally, and a
+client function named `web_fetch` without the native `type` stays client-owned. Page content reaches the client only
+through the model's answer; returning `server_tool_use` blocks to the client (#409) and PDF text are follow-ups.
+
 ## 🧩 Tool Ownership Model
 
 Every tool call has exactly one execution path, so nothing runs by accident:
 
 | Ownership | Who executes it | Examples |
 | --- | --- | --- |
-| **Gateway-owned** | Agentic API executes it server-side and continues the loop | Web search, file search, MCP-backed tools |
-| **Client-owned** | Preserved and returned to the client | Codex shell / editor tools, your functions |
+| **Gateway-owned** | Agentic API executes it server-side and continues the loop | Web search, MCP-backed tools, code interpreter (opt-in) |
+| **Client-owned** | Preserved and returned to the client | Shell tool, Codex editor tools, your functions |
 | **Provider-owned** | Passed through to vLLM or an upstream provider | Provider-native tools |
 
 Unknown or ambiguous tool shapes are **never executed by default**. They are preserved and returned.
+
+## 🤝 Multi-agent Responses
+
+Set `multi_agent.enabled` on a stored Responses request and the gateway runs the [Responses multi-agent](https://developers.openai.com/api/docs/guides/responses-multi-agent) collaboration loop itself: the root agent spawns subagents, each with its own history and tool registry, and the response returns their attributed `multi_agent_call`, `multi_agent_call_output`, and `agent_message` items. Continue the whole agent tree with `previous_response_id`.
+
+```bash
+curl http://localhost:9000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-30B-A3B-FP8",
+    "store": true,
+    "multi_agent": {"enabled": true, "max_concurrent_subagents": 3},
+    "input": "Have one agent review correctness and another review test coverage, then summarize."
+  }'
+```
+
+- `store: true` is required; the gateway does not yet support stateless multi-agent requests.
+- `max_concurrent_subagents` limits active descendant turns (default `3`); it is not a total agent count.
+- Multi-agent execution is HTTP and SSE only. WebSocket requests with multi-agent enabled are rejected.
+- `max_tool_calls` and reasoning summaries are rejected while multi-agent is enabled.
+
+See [HTTP multi-agent execution](ARCHITECTURE.md#http-multi-agent-execution) for scheduling and persistence details.
 
 ## 🏗️ Repository Layout
 
 ```
 crates/
-├── agentic-server/       # Axum binary, transport handlers (HTTP/SSE/WS), configuration
+├── agentic-server/       # Axum binary, transport handlers (HTTP/SSE/WS), configuration, `agentic` CLI
 ├── agentic-server-core/  # Protocol types, executor, tool framework, persistence
+├── agentic-llm-d/        # Split-execution state backend for the llm-d coordinator
+├── agentic-cli-docs/     # Build-time generator for the CLI reference docs
 └── agentic-praxis/       # Praxis gateway integration
+python/agentic_api/       # Python distribution and launcher for the packaged gateway
 docs/                     # MkDocs documentation, ADRs, and design notes
 ```
 
@@ -588,10 +787,14 @@ Design and migration decisions are tracked as ADRs in [docs/adr/](docs/adr/), wi
 
 - [x] **Responses API hydration**: stateful continuation with `previous_response_id`
 - [x] **Codex support**: practical Codex sessions through the Responses API
-- [x] **Server-side tool execution**: explicit ownership, web search built in
-- [ ] **Messages API**: built on the same persistence and execution primitives
+- [x] **Server-side tool execution**: explicit ownership, web search, web fetch, MCP, and code interpreter built in
+- [x] **Messages API**: Claude Code support with a server-side gateway tool loop
+- [x] **Conversations API**: OpenAI-compatible conversation and item management
+- [ ] **Multi-agent Responses**: HTTP execution ships today; WebSocket injection and stateless requests are next
+- [ ] **File search**: Files and Vector Stores APIs with a gateway-executed `file_search` tool
+- [ ] **Stateful Messages**: Messages continuation on the same persistence and execution primitives
 - [ ] **Interactions API**: durable, higher-level agentic workflows
-- [ ] **Production hardening**: storage backends, observability, cached-prefix continuation
+- [ ] **Production hardening**: tenant-scoped state, gateway metrics, cached-prefix continuation
 
 ______________________________________________________________________
 

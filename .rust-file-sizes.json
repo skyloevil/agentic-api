@@ -1,19 +1,52 @@
 {
   "version": 1,
   "baseline": {
-    "crates/agentic-server-core/src/executor/accumulator/mod.rs": 666,
-    "crates/agentic-server-core/src/executor/engine.rs": 522,
-    "crates/agentic-server-core/src/executor/gateway.rs": 612,
+    "crates/agentic-server-core/src/executor/accumulator/mod.rs": 590,
     "crates/agentic-server-core/src/executor/session.rs": 508,
     "crates/agentic-server-core/src/tool/registry.rs": 515,
-    "crates/agentic-server-core/src/tool/tool_search.rs": 1764,
-    "crates/agentic-server-core/src/types/io/input.rs": 629,
-    "crates/agentic-server-core/src/types/io/output.rs": 1092,
-    "crates/agentic-server-core/src/types/request_response.rs": 518,
+    "crates/agentic-server-core/src/tool/tool_search.rs": 1661,
+    "crates/agentic-server-core/src/types/io/input.rs": 510,
+    "crates/agentic-server-core/src/types/io/output.rs": 1074,
     "crates/agentic-server/src/agentic_process.rs": 557,
-    "crates/agentic-server/src/auth.rs": 791,
-    "crates/agentic-server/src/handler/websocket/responses.rs": 784
+    "crates/agentic-server/src/auth.rs": 791
   },
-  "exceptions": {},
+  "exceptions": {
+    "crates/agentic-server-core/src/config.rs": {
+      "limit": 643,
+      "reason": "The gateway-executed web_fetch settings join the shared tool runtime configuration beside the web-search provider and code-interpreter limits, and the web_search provider enum now also selects SearXNG."
+    },
+    "crates/agentic-server-core/src/executor/accumulator/active.rs": {
+      "limit": 512,
+      "reason": "Code-interpreter call state shares the typed item lifecycle dispatcher with multi-agent call and agent-message states."
+    },
+    "crates/agentic-server-core/src/executor/accumulator/mod.rs": {
+      "limit": 607,
+      "reason": "Merge the main branch multi-agent and code-interpreter ingestion into the existing accumulator while preserving service-tier accounting."
+    },
+    "crates/agentic-server-core/src/executor/accumulator/slot.rs": {
+      "limit": 518,
+      "reason": "Code-interpreter done-only ID backfill remains in the shared output-item slot validation path."
+    },
+    "crates/agentic-server-core/src/tool/registry.rs": {
+      "limit": 545,
+      "reason": "The web_fetch executor binds through the existing registry validation and executor registration flow, like the code interpreter."
+    },
+    "crates/agentic-server-core/src/tool/tool_search.rs": {
+      "limit": 1681,
+      "reason": "Code-interpreter continuation items pass through tool-search history without changing discovery state."
+    },
+    "crates/agentic-server-core/src/types/io/input.rs": {
+      "limit": 514,
+      "reason": "The shared input-item union accepts typed native code-interpreter calls for continuation replay."
+    },
+    "crates/agentic-server-core/src/types/tools/params.rs": {
+      "limit": 570,
+      "reason": "The shared tagged tool declaration validates the OpenAI auto-container form and exposes its closed public schema."
+    },
+    "crates/agentic-server/src/main.rs": {
+      "limit": 644,
+      "reason": "Server configuration resolves the web_fetch settings with the same file and environment precedence as the other tool settings."
+    }
+  },
   "generated": {}
 }

@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
+use std::time::Duration;
 
 use agentic_core::McpServerEntry;
-use agentic_core::config::{CONFIG_FILE_NAME, WebSearchProviderKind};
+use agentic_core::config::{CONFIG_FILE_NAME, CodeInterpreterRuntimeConfig, WebSearchProviderKind};
 use agentic_core::error::Error;
 use agentic_server::model_capabilities::{InputModalities, ModelCapabilities};
 use serde::{Deserialize, Serialize};
@@ -12,13 +13,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct WebSearchFileConfig {
-    /// Search backend (`you`, `brave`, or `tavily`); unset selects You.com.
+    /// Search backend (`you`, `brave`, `tavily`, or `searxng`); unset selects You.com.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<WebSearchProviderKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Environment variable holding the provider's API key; unset uses the
-    /// provider's conventional variable (`YOU_API_KEY`, `BRAVE_API_KEY`, `TAVILY_API_KEY`).
+    /// provider's conventional variable (`YOU_API_KEY`, `BRAVE_API_KEY`,
+    /// `TAVILY_API_KEY`, `SEARXNG_API_KEY`); SearXNG needs no key unless a
+    /// proxy demands one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     /// Ceiling on concurrent provider requests within one batched search.
@@ -32,6 +35,32 @@ impl WebSearchFileConfig {
             && self.base_url.is_none()
             && self.api_key_env.is_none()
             && self.max_concurrent_queries.is_none()
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct WebFetchFileConfig {
+    /// Whether native `web_fetch` declarations are executed; unset means enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Whether fetches may reach private, loopback, and other non-public addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_private_networks: Option<bool>,
+    /// Bytes read from one page before the download is cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<NonZeroUsize>,
+    /// Seconds allowed for one fetch, including redirects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<NonZeroU64>,
+}
+
+impl WebFetchFileConfig {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.allow_private_networks.is_none()
+            && self.max_response_bytes.is_none()
+            && self.timeout_secs.is_none()
     }
 }
 
@@ -58,6 +87,76 @@ pub(crate) struct ServerFileConfig {
 impl ServerFileConfig {
     fn is_empty(&self) -> bool {
         self.max_request_body_size_bytes.is_none()
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct CodeInterpreterFileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_bytes: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_wall_time_seconds: Option<NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fuel: Option<NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_guest_memory_bytes: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_stdout_bytes: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_stderr_bytes: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_guests: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_aggregate_guest_memory_bytes: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_worker_memory_bytes: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_aggregate_worker_memory_bytes: Option<NonZeroUsize>,
+}
+
+impl CodeInterpreterFileConfig {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.max_source_bytes.is_none()
+            && self.execution_wall_time_seconds.is_none()
+            && self.max_fuel.is_none()
+            && self.max_guest_memory_bytes.is_none()
+            && self.max_stdout_bytes.is_none()
+            && self.max_stderr_bytes.is_none()
+            && self.max_concurrent_guests.is_none()
+            && self.max_aggregate_guest_memory_bytes.is_none()
+            && self.max_worker_memory_bytes.is_none()
+            && self.max_aggregate_worker_memory_bytes.is_none()
+    }
+
+    /// Apply file values to safe, disabled defaults. Environment precedence is
+    /// resolved separately by the server entry point.
+    #[must_use]
+    pub(crate) fn with_defaults(&self) -> CodeInterpreterRuntimeConfig {
+        let defaults = CodeInterpreterRuntimeConfig::default();
+        CodeInterpreterRuntimeConfig {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            max_source_bytes: self.max_source_bytes.unwrap_or(defaults.max_source_bytes),
+            execution_wall_time: Duration::from_secs(
+                self.execution_wall_time_seconds
+                    .map_or(defaults.execution_wall_time.as_secs(), NonZeroU64::get),
+            ),
+            max_fuel: self.max_fuel.unwrap_or(defaults.max_fuel),
+            max_guest_memory_bytes: self.max_guest_memory_bytes.unwrap_or(defaults.max_guest_memory_bytes),
+            max_stdout_bytes: self.max_stdout_bytes.unwrap_or(defaults.max_stdout_bytes),
+            max_stderr_bytes: self.max_stderr_bytes.unwrap_or(defaults.max_stderr_bytes),
+            max_concurrent_guests: self.max_concurrent_guests.unwrap_or(defaults.max_concurrent_guests),
+            max_aggregate_guest_memory_bytes: self
+                .max_aggregate_guest_memory_bytes
+                .unwrap_or(defaults.max_aggregate_guest_memory_bytes),
+            max_worker_memory_bytes: self.max_worker_memory_bytes.unwrap_or(defaults.max_worker_memory_bytes),
+            max_aggregate_worker_memory_bytes: self
+                .max_aggregate_worker_memory_bytes
+                .unwrap_or(defaults.max_aggregate_worker_memory_bytes),
+        }
     }
 }
 
@@ -133,12 +232,16 @@ pub(crate) struct FileConfig {
     pub database_url: Option<String>,
     #[serde(skip_serializing_if = "WebSearchFileConfig::is_empty")]
     pub web_search: WebSearchFileConfig,
+    #[serde(skip_serializing_if = "WebFetchFileConfig::is_empty")]
+    pub web_fetch: WebFetchFileConfig,
     #[serde(skip_serializing_if = "McpFileConfig::is_empty")]
     pub mcp: McpFileConfig,
     #[serde(skip_serializing_if = "ServerFileConfig::is_empty")]
     pub server: ServerFileConfig,
     #[serde(skip_serializing_if = "ToolsFileConfig::is_empty")]
     pub tools: ToolsFileConfig,
+    #[serde(skip_serializing_if = "CodeInterpreterFileConfig::is_empty")]
+    pub code_interpreter: CodeInterpreterFileConfig,
     #[serde(skip_serializing_if = "MessagesGatewayFileConfig::is_empty")]
     pub messages_gateway: MessagesGatewayFileConfig,
     #[serde(skip_serializing_if = "ResponsesFileConfig::is_empty")]
@@ -295,6 +398,12 @@ impl FileConfig {
                 path.display()
             )));
         }
+        self.code_interpreter.with_defaults().validate().map_err(|error| {
+            Error::Config(format!(
+                "configuration file {} contains invalid code interpreter limits: {error}",
+                path.display()
+            ))
+        })?;
         for (label, server) in &self.mcp_servers {
             if let Some(allowed_tools) = server.allowed_tools() {
                 if allowed_tools.is_empty() {
@@ -324,13 +433,16 @@ impl FileConfig {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU64, NonZeroUsize};
 
     use agentic_core::McpServerEntry;
     use agentic_server::model_capabilities::{InputModalities, UpstreamCapabilities};
     use tempfile::tempdir;
 
-    use super::{FileConfig, McpFileConfig, ServerFileConfig, WebSearchFileConfig, WebSearchProviderKind};
+    use super::{
+        CodeInterpreterFileConfig, FileConfig, McpFileConfig, ServerFileConfig, WebSearchFileConfig,
+        WebSearchProviderKind,
+    };
 
     #[test]
     fn missing_config_file_uses_defaults() {
@@ -581,6 +693,80 @@ mod tests {
     }
 
     #[test]
+    fn code_interpreter_file_limits_are_operator_owned_and_default_disabled() {
+        let defaults = CodeInterpreterFileConfig::default().with_defaults();
+        assert!(!defaults.enabled);
+
+        let home = tempdir().expect("temp home");
+        fs::write(
+            home.path().join("config.toml"),
+            concat!(
+                "[code_interpreter]\n",
+                "enabled = true\n",
+                "max_source_bytes = 4096\n",
+                "execution_wall_time_seconds = 3\n",
+                "max_fuel = 12345\n",
+                "max_guest_memory_bytes = 64\n",
+                "max_stdout_bytes = 16\n",
+                "max_stderr_bytes = 8\n",
+                "max_concurrent_guests = 2\n",
+                "max_aggregate_guest_memory_bytes = 128\n"
+            ),
+        )
+        .expect("write config");
+
+        let config = FileConfig::load(home.path())
+            .expect("valid operator limits")
+            .expect("existing config")
+            .code_interpreter
+            .with_defaults();
+        assert!(config.enabled);
+        assert_eq!(config.max_source_bytes.get(), 4096);
+        assert_eq!(config.execution_wall_time, std::time::Duration::from_secs(3));
+        assert_eq!(config.max_fuel.get(), 12_345);
+        assert_eq!(config.max_guest_memory_bytes.get(), 64);
+        assert_eq!(config.max_aggregate_guest_memory_bytes.get(), 128);
+    }
+
+    #[test]
+    fn rejects_code_interpreter_under_tools() {
+        let home = tempdir().expect("temp home");
+        fs::write(
+            home.path().join("config.toml"),
+            "[tools.code_interpreter]\nenabled = true\n",
+        )
+        .expect("write config");
+
+        let error = FileConfig::load(home.path()).expect_err("code interpreter config must be top-level");
+        assert!(error.to_string().contains("unknown field `code_interpreter`"));
+    }
+
+    #[test]
+    fn code_interpreter_file_limits_reject_zero_and_impossible_memory_reservations() {
+        let home = tempdir().expect("temp home");
+        fs::write(
+            home.path().join("config.toml"),
+            "[code_interpreter]\nmax_stdout_bytes = 0\n",
+        )
+        .expect("write config");
+        let zero_error = FileConfig::load(home.path()).expect_err("zero byte limit must fail deserialization");
+        assert!(zero_error.to_string().contains("max_stdout_bytes"));
+
+        fs::write(
+            home.path().join("config.toml"),
+            concat!(
+                "[code_interpreter]\n",
+                "max_guest_memory_bytes = 129\n",
+                "max_aggregate_guest_memory_bytes = 128\n"
+            ),
+        )
+        .expect("replace config");
+        let reservation_error =
+            FileConfig::load(home.path()).expect_err("an impossible single guest reservation must fail startup config");
+        assert!(reservation_error.to_string().contains("max_guest_memory_bytes"));
+    }
+
+    #[test]
     fn rejects_zero_max_request_body_size() {
         let home = tempdir().expect("temp home");
         fs::write(
@@ -612,6 +798,40 @@ mod tests {
                 .map(std::num::NonZeroUsize::get),
             Some(1_048_576)
         );
+    }
+
+    #[test]
+    fn web_fetch_settings_round_trip_and_reject_unknown_keys() {
+        let home = tempdir().expect("temp home");
+        fs::write(
+            home.path().join("config.toml"),
+            "[web_fetch]\nenabled = false\nallow_private_networks = true\nmax_response_bytes = 4096\ntimeout_secs = 7\n",
+        )
+        .expect("write config");
+        let config = FileConfig::load(home.path())
+            .expect("load config")
+            .expect("existing config");
+        assert_eq!(config.web_fetch.enabled, Some(false));
+        assert_eq!(config.web_fetch.allow_private_networks, Some(true));
+        assert_eq!(config.web_fetch.max_response_bytes.map(NonZeroUsize::get), Some(4096));
+        assert_eq!(config.web_fetch.timeout_secs.map(NonZeroU64::get), Some(7));
+        let rendered = toml::to_string(&config).expect("serialize config");
+        assert!(rendered.contains("[web_fetch]"), "{rendered}");
+        assert!(rendered.contains("allow_private_networks = true"), "{rendered}");
+
+        let rendered = toml::to_string(&FileConfig::default()).expect("serialize defaults");
+        assert!(
+            !rendered.contains("web_fetch"),
+            "an empty section is not written: {rendered}"
+        );
+
+        fs::write(home.path().join("config.toml"), "[web_fetch]\nmax_response_bytes = 0\n").expect("write config");
+        let error = FileConfig::load(home.path()).expect_err("zero download ceiling must fail");
+        assert!(error.to_string().contains("max_response_bytes"), "{error}");
+
+        fs::write(home.path().join("config.toml"), "[web_fetch]\nfetch_timeout = 1\n").expect("write config");
+        let error = FileConfig::load(home.path()).expect_err("unknown keys must fail");
+        assert!(error.to_string().contains("fetch_timeout"), "{error}");
     }
 
     #[test]
@@ -647,6 +867,23 @@ mod tests {
             toml::to_string(&config)
                 .expect("serialize config")
                 .contains("provider = \"tavily\"")
+        );
+
+        fs::write(
+            home.path().join("config.toml"),
+            "[web_search]\nprovider = \"searxng\"\nbase_url = \"http://searxng:8080\"\n",
+        )
+        .expect("write config");
+        let config = FileConfig::load(home.path())
+            .expect("load config")
+            .expect("existing config");
+        assert_eq!(config.web_search.provider, Some(WebSearchProviderKind::Searxng));
+        assert_eq!(config.web_search.base_url.as_deref(), Some("http://searxng:8080"));
+        assert_eq!(config.web_search.api_key_env, None);
+        assert!(
+            toml::to_string(&config)
+                .expect("serialize config")
+                .contains("provider = \"searxng\"")
         );
 
         fs::write(home.path().join("config.toml"), "[web_search]\nprovider = \"bing\"\n").expect("write config");

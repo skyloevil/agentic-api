@@ -156,8 +156,8 @@ impl ResponseSession {
     /// Wait until the active turn has published or dropped its continuation.
     ///
     /// This is not cancellation: callers must first drop the execution stream
-    /// or otherwise stop its worker. It prevents a subsequent serial request
-    /// racing the asynchronous disposal triggered by dropping that stream.
+    /// or cancel and join its owning task. Stream-owned producers are disposed
+    /// synchronously on drop; this also fences independently scheduled callers.
     /// The ending lease releases its parent reference before becoming idle;
     /// other sessions may still keep that shared checkpoint alive and charged.
     ///
@@ -772,6 +772,7 @@ mod tests {
         let too_small = session(10, size - 1);
         let lease = too_small.begin(None).unwrap();
         let metadata = ResponseMetadata {
+            multi_agent_tree: None,
             effective_instructions: Some("large metadata".repeat(100)),
             ..ResponseMetadata::default()
         };
@@ -786,6 +787,7 @@ mod tests {
         let session = session(10, 10_000);
         let lease = session.begin(None).unwrap();
         let metadata = ResponseMetadata {
+            multi_agent_tree: None,
             effective_tools: Some(
                 serde_json::from_value(json!([{
                     "type":"mcp", "server_label":"counter", "server_url":"https://example.com/mcp",

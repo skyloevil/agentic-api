@@ -1,14 +1,12 @@
 //! Typed Messages MCP connector declarations and public content projections.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{GatewayToolResult, ToolParam};
-use crate::tool::ToolError;
-use crate::types::tools::{McpToolParam, ResponsesTool};
+use super::GatewayToolResult;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -71,59 +69,6 @@ impl McpToolsetConfig {
     }
 }
 
-/// Resolve toolsets to the same typed declarations used by Responses discovery.
-///
-/// # Errors
-/// Rejects ambiguous server identities and missing or duplicate toolsets before I/O.
-pub fn connector_tools(servers: &[MessagesMcpServer], tools: &[ToolParam]) -> Result<Vec<ResponsesTool>, ToolError> {
-    let mut names = HashSet::new();
-    for server in servers {
-        if server.name.is_empty() || !names.insert(server.name.as_str()) {
-            return Err(ToolError::Config(
-                "MCP server names must be non-empty and unique".to_owned(),
-            ));
-        }
-        if !server.url.starts_with("https://") {
-            return Err(ToolError::Config("Messages MCP server URLs must use HTTPS".to_owned()));
-        }
-    }
-    let mut used = HashSet::new();
-    let mut resolved = Vec::new();
-    for tool in tools.iter().filter(|t| t.type_.as_deref() == Some("mcp_toolset")) {
-        let server = tool
-            .mcp_server_name
-            .as_deref()
-            .and_then(|name| servers.iter().find(|server| server.name == name))
-            .ok_or_else(|| ToolError::Config("mcp_toolset must reference a declared MCP server".to_owned()))?;
-        if !used.insert(server.name.as_str()) {
-            return Err(ToolError::Config(
-                "each MCP server must have exactly one mcp_toolset".to_owned(),
-            ));
-        }
-        resolved.push(ResponsesTool::Mcp(McpToolParam {
-            server_label: server.name.clone(),
-            server_url: Some(server.url.clone()),
-            authorization: server.authorization_token.clone(),
-            connector_id: None,
-            headers: None,
-            allowed_tools: None,
-            require_approval: Some("never".to_owned()),
-            defer_loading: None,
-            discovered_tools: Vec::new(),
-            messages_config: Some(McpToolsetConfig {
-                default_config: tool.default_config.clone().unwrap_or_default(),
-                configs: tool.configs.clone().unwrap_or_default(),
-            }),
-        }));
-    }
-    if used.len() != servers.len() {
-        return Err(ToolError::Config(
-            "each MCP server must have exactly one mcp_toolset".to_owned(),
-        ));
-    }
-    Ok(resolved)
-}
-
 /// Public Messages projections; execution and call IDs stay in the shared tool path.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -170,6 +115,8 @@ impl McpContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::mcp::messages::connector_tools;
+    use crate::types::messages::ToolParam;
     use serde_json::json;
 
     #[test]

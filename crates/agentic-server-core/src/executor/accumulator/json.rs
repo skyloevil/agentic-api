@@ -2,7 +2,8 @@
 
 use crate::events::ensure_supported_output_item_type;
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::types::io::OutputItem;
+use crate::types::io::{OutputItem, ReasoningOutput};
+use crate::utils::common::deserialize_from_value_opt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -25,6 +26,12 @@ fn missing_field(owner: &str, field: &str) -> ExecutorError {
 /// # Errors
 /// [`ExecutorError::InvalidRequest`] naming the field that is missing or invalid.
 pub(super) fn ensure_strict_response(json: &Value) -> ExecutorResult<()> {
+    if json
+        .get("service_tier")
+        .is_some_and(|tier| !tier.is_null() && !tier.is_string())
+    {
+        return Err(missing_field("upstream response", "service_tier"));
+    }
     let Some(status) = json["status"].as_str() else {
         return Err(ExecutorError::InvalidRequest(
             "upstream response has no 'status'".to_owned(),
@@ -59,4 +66,18 @@ pub(super) fn ensure_strict_response(json: &Value) -> ExecutorResult<()> {
         }
     }
     Ok(())
+}
+
+/// Decodes one upstream output item under lenient ingestion, dropping unreadable items.
+///
+/// Earlier releases relayed reasoning with untyped fields. Keep such an item with
+/// the fields the typed schema accepts instead of dropping it; strict ingestion
+/// rejects it in [`ensure_strict_response`].
+pub(super) fn lenient_output_item(item: Value) -> Option<OutputItem> {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return deserialize_from_value_opt(item);
+    }
+    OutputItem::deserialize(&item)
+        .ok()
+        .or_else(|| ReasoningOutput::from_legacy_value(&item).map(OutputItem::Reasoning))
 }

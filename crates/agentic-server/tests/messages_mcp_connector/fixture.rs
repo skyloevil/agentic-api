@@ -211,7 +211,7 @@ pub async fn inference() -> (String, Requests, tokio::task::JoinHandle<()>) {
                 let content = content(&body);
                 let stop = if body["model"].as_str().unwrap().starts_with("truncated") { "max_tokens" } else if content.iter().any(|b| b["type"] == "tool_use") { "tool_use" } else { "end_turn" };
                 if body["stream"] == true {
-                    axum::response::IntoResponse::into_response(([(http::header::CONTENT_TYPE,"text/event-stream")], frames(content,stop)))
+                    axum::response::IntoResponse::into_response(([(http::header::CONTENT_TYPE,"text/event-stream")], frames(content,stop,body["model"].as_str().unwrap())))
                 } else {
                     axum::response::IntoResponse::into_response(axum::Json(json!({"id":"msg", "type":"message", "role":"assistant", "model":"test", "content":content,"stop_reason":stop,"usage":{"input_tokens":2,"output_tokens":3}})))
                 }
@@ -268,13 +268,13 @@ fn content(body: &Value) -> Vec<Value> {
         ]);
     }
     blocks.push(json!({"type":"tool_use","id":"call","name":name,"input":{"text":"hello"}}));
-    if body["model"] == "truncated_mixed" {
+    if matches!(body["model"].as_str(), Some("truncated_mixed" | "mixed")) {
         blocks.push(json!({"type":"tool_use", "id":"client", "name":"client_echo", "input":{}}));
     }
     blocks
 }
 
-fn frames(content: Vec<Value>, stop: &str) -> String {
+fn frames(content: Vec<Value>, stop: &str, mode: &str) -> String {
     let mut events = vec![
         json!({"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","content":[],"usage":{"input_tokens":2,"output_tokens":0}}}),
     ];
@@ -296,6 +296,29 @@ fn frames(content: Vec<Value>, stop: &str) -> String {
     }
     events.push(json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":3}}));
     events.push(json!({"type":"message_stop"}));
+    match mode {
+        "missing_stop" => {
+            events.pop();
+        }
+        "open_block" => events.retain(|event| event["type"] != "content_block_stop"),
+        "missing_start" => {
+            events.remove(0);
+        }
+        "duplicate_block" => {
+            events.insert(2, events[1].clone());
+        }
+        "delta_after_stop" => {
+            let position = events
+                .iter()
+                .position(|event| event["type"] == "content_block_stop")
+                .unwrap();
+            events.insert(
+                position + 1,
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            );
+        }
+        _ => {}
+    }
     let mut frames = String::new();
     for event in events {
         write!(frames, "event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()).unwrap();

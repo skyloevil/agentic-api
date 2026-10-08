@@ -7,8 +7,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use agentic_core::executor::RequestContext;
+use agentic_core::tool::responses_declarations;
 use agentic_core::tool::{
-    CodexNamespaceHandler, GatewayExecutors, ToolRegistry, ToolType, model_visible_namespace_member_name,
+    CodexNamespaceHandler, GatewayExecutors, ToolDeclaration, ToolRegistry, ToolType,
+    model_visible_namespace_member_name,
 };
 use agentic_core::types::request_response::RequestPayload;
 use agentic_core::types::tools::ResponsesTool;
@@ -96,6 +98,7 @@ fn parse_tools_from_turn(cassette_file: &str, turn_idx: usize, turn: &Turn) -> V
 
 fn upstream_request_value(payload: RequestPayload, stream: bool) -> Value {
     let ctx = RequestContext {
+        multi_agent_tree: None,
         original_request: payload.clone(),
         enriched_request: payload,
         new_input_items: Vec::new(),
@@ -137,9 +140,9 @@ fn assert_tools_normalize(cassette_file: &str) {
         };
         let tools: Vec<ResponsesTool> = serde_json::from_value(tools_val).expect("tools parse");
         let resolved = CodexNamespaceHandler
-            .resolve_namespace_members(&tools)
+            .resolve_namespace_members(&responses_declarations(&tools))
             .unwrap_or_else(|err| panic!("{cassette_file} turn {i}: namespace resolution failed: {err}"));
-        let normalized: Vec<_> = resolved.iter().flat_map(ResponsesTool::to_function_tools).collect();
+        let normalized: Vec<_> = resolved.iter().flat_map(ToolDeclaration::to_function_tools).collect();
         for ft in &normalized {
             assert_eq!(
                 ft.type_, "function",
@@ -155,8 +158,8 @@ fn assert_tools_normalize(cassette_file: &str) {
         let function_count = resolved
             .iter()
             .map(|t| match t {
-                ResponsesTool::Function(_) => 1,
-                ResponsesTool::Namespace(namespace) => namespace
+                ToolDeclaration::Function(_) => 1,
+                ToolDeclaration::Namespace(namespace) => namespace
                     .tools
                     .iter()
                     .filter(|member| matches!(member, agentic_core::types::CodexNamespaceMember::Function(_)))
@@ -181,9 +184,10 @@ async fn assert_registry_lookup(cassette_file: &str) {
         let Some(tools_val) = tools_from_turn(turn) else {
             continue;
         };
-        let mut tools: Vec<ResponsesTool> = serde_json::from_value(tools_val).expect("tools parse");
+        let tools: Vec<ResponsesTool> = serde_json::from_value(tools_val).expect("tools parse");
         let declared_tools = tools.clone();
-        let registry = ToolRegistry::build_with_handlers(&mut tools, &mut GatewayExecutors::default())
+        let mut declarations = responses_declarations(&tools);
+        let registry = ToolRegistry::build_with_handlers(&mut declarations, &mut GatewayExecutors::default())
             .await
             .unwrap_or_else(|err| panic!("{cassette_file} turn {i}: registry failed: {err}"));
         for tool in &declared_tools {
@@ -380,11 +384,11 @@ fn codex_namespace_cassettes_flatten_to_safe_upstream_function_name() {
             );
 
             let resolved = CodexNamespaceHandler
-                .resolve_namespace_members(&tools)
+                .resolve_namespace_members(&responses_declarations(&tools))
                 .unwrap_or_else(|err| panic!("{filename} turn {i}: namespace resolution failed: {err}"));
             assert!(
                 resolved.iter().any(|tool| {
-                    matches!(tool, ResponsesTool::Namespace(namespace)
+                    matches!(tool, ToolDeclaration::Namespace(namespace)
                     if namespace.tools.iter().any(|member| matches!(
                         member,
                         agentic_core::types::CodexNamespaceMember::Function(function)
@@ -393,7 +397,7 @@ fn codex_namespace_cassettes_flatten_to_safe_upstream_function_name() {
                 }),
                 "{filename} turn {i}: expected renamed namespace member {expected_flat_name}"
             );
-            let upstream_tools: Vec<_> = resolved.iter().flat_map(ResponsesTool::to_function_tools).collect();
+            let upstream_tools: Vec<_> = resolved.iter().flat_map(ToolDeclaration::to_function_tools).collect();
             assert!(
                 upstream_tools.iter().any(|tool| tool.name == expected_flat_name),
                 "{filename} turn {i}: expected upstream FunctionTool {expected_flat_name}"
@@ -424,13 +428,13 @@ fn codex_direct_vllm_flat_namespace_cassette_is_plain_function_tool() {
         );
 
         let flattened = CodexNamespaceHandler
-            .resolve_namespace_members(&tools)
+            .resolve_namespace_members(&responses_declarations(&tools))
             .unwrap_or_else(|err| panic!("{filename} turn {i}: namespace resolution failed: {err}"));
         assert_eq!(flattened.len(), 1);
         assert!(
             matches!(
                 &flattened[0],
-                ResponsesTool::Function(function) if function.name.as_str() == expected_flat_name
+                ToolDeclaration::Function(function) if function.name.as_str() == expected_flat_name
             ),
             "{filename} turn {i}: flattening should preserve already-flat direct vLLM function"
         );

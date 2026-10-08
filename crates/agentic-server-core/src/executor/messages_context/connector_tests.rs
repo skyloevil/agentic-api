@@ -4,8 +4,8 @@ use crate::executor::{
     ConversationHandler, ExecutionContext, MessagesUpstream, ResponseHandler, run_messages_loop, run_messages_stream,
 };
 use crate::storage::{ConversationStore, ResponseStore};
+use crate::tool::mcp::messages::connector_tools;
 use crate::tool::{GatewayExecutorRegistration, GatewayExecutors, McpClient, McpHandler, ToolRegistry, ToolType};
-use crate::types::messages::mcp::connector_tools;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -67,7 +67,7 @@ async fn prepare_fixture(raw: Value) -> (MessagesRequestContext, ToolRegistry) {
     // Inject a configured fixture binding after testing the wire-to-typed conversion;
     // production request-declared connections retain the shared outbound host policy.
     for tool in &mut tools {
-        if let crate::types::tools::ResponsesTool::Mcp(param) = tool {
+        if let crate::tool::ToolDeclaration::Mcp(param) = tool {
             assert_eq!(param.authorization.as_deref(), Some("connector-secret"));
             assert_eq!(param.require_approval.as_deref(), Some("never"));
             param.server_url = None;
@@ -115,7 +115,7 @@ async fn discovered_ownership_configuration_credentials_and_replay() {
     ]}]);
     // Replay lowering uses the same normalized tools and preserves extension fields.
     let mut tools = connector_tools(ctx.typed.mcp_servers.as_deref().unwrap(), ctx.tools().unwrap()).unwrap();
-    if let crate::types::tools::ResponsesTool::Mcp(param) = &mut tools[0] {
+    if let crate::tool::ToolDeclaration::Mcp(param) = &mut tools[0] {
         param.discovered_tools = normalized_tools
             .as_array()
             .unwrap()
@@ -462,4 +462,51 @@ fn historical_names_reuse_shared_collision_handling_without_execution_grants() {
     assert_ne!(blocks[0]["name"], blocks[1]["name"]);
     assert_eq!(blocks[1]["name"], "mcp__a_b__echo");
     assert!(!map.is_gateway_owned(blocks[0]["name"].as_str().unwrap()));
+}
+
+#[tokio::test]
+async fn connector_cache_boundaries_preserve_tool_order() {
+    let mut raw = request(false);
+    raw["tools"] = json!([
+        {"name":"before", "input_schema":{"type":"object"}},
+        {"type":"mcp_toolset", "mcp_server_name":"counter", "cache_control":{"type":"ephemeral","ttl":"1h"}},
+        {"name":"after", "input_schema":{"type":"object"}, "cache_control":{"type":"ephemeral"}}
+    ]);
+    let (ctx, _) = prepare_fixture(raw).await;
+    let tools = ctx.raw["tools"].as_array().unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "before",
+            "mcp__counter__echo",
+            "mcp__counter__fail",
+            "mcp__counter__disabled",
+            "after"
+        ]
+    );
+    assert!(tools[1].get("cache_control").is_none());
+    assert!(tools[2].get("cache_control").is_none());
+    assert_eq!(tools[3]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+    assert_eq!(tools[4]["cache_control"], json!({"type":"ephemeral"}));
+}
+
+#[test]
+fn empty_toolset_cache_boundary_is_rejected_instead_of_lost() {
+    let mut raw = json!({"mcp_servers":[], "tools":[
+        {"name":"client", "input_schema":{"type":"object"}},
+        {"type":"mcp_toolset", "mcp_server_name":"s", "cache_control":{"type":"ephemeral"}}
+    ]});
+    let declarations = connector_tools(
+        &[serde_json::from_value(json!({"type":"url", "name":"s", "url":"https://example.com/mcp"})).unwrap()],
+        &[serde_json::from_value(raw["tools"][1].clone()).unwrap()],
+    )
+    .unwrap();
+    let error = normalize_connector(&mut raw, &declarations, &mut GatewayToolMap::default()).unwrap_err();
+    assert!(error.to_string().contains("empty MCP toolset"));
+    raw["tools"] = json!([{ "type":"mcp_toolset", "mcp_server_name":"s" }]);
+    normalize_connector(&mut raw, &declarations, &mut GatewayToolMap::default()).unwrap();
+    assert_eq!(raw["tools"], json!([]));
 }
