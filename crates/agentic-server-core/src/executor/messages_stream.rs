@@ -18,7 +18,8 @@
 
 mod blocks;
 mod wire;
-use blocks::{BufferedBlock, StreamedCall, execute_gateway_calls};
+use crate::utils::common::serialize_to_value;
+use blocks::{BufferedBlock, execute_gateway_calls};
 use wire::{error_sse, executor_error_sse, sse};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -63,7 +64,7 @@ pub async fn run_messages_stream(
     let mut execution = ExecutionSpan::start(Api::Messages, Route::Executor, true);
     let span = execution.span().clone();
     let first_round = span.in_scope(|| super::telemetry::stages::inference_round(0));
-    let primed = prime_messages_stream(&ctx, &exec_ctx, &upstream)
+    let primed = send_messages_round(&ctx, &exec_ctx, &upstream)
         .instrument(first_round.clone())
         .await;
     let first_response = match primed {
@@ -89,9 +90,9 @@ pub async fn run_messages_stream(
     })
 }
 
-/// Send the first upstream request before the handler commits an HTTP 200, so
-/// initial vLLM errors retain their original status and body.
-async fn prime_messages_stream(
+/// Send one upstream round; the first runs before committing HTTP 200 so initial
+/// vLLM errors retain their original status and body.
+async fn send_messages_round(
     ctx: &MessagesRequestContext,
     exec_ctx: &ExecutionContext,
     upstream: &MessagesUpstream,
@@ -121,7 +122,7 @@ fn messages_stream_body(
 ) -> BoxStream {
     Box::pin(stream! {
         let mut acc = MessagesStreamAccumulator {
-            gateway_map: exec_ctx.messages_gateway_tools.clone(),
+            gateway_map: ctx.gateway_tools_or(&exec_ctx.messages_gateway_tools).clone(),
             ..Default::default()
         };
         let mut prepared_response = Some(first_response);
@@ -131,23 +132,7 @@ fn messages_stream_body(
                 response
             } else {
                 let round_span = super::telemetry::stages::inference_round(round);
-                let body = match ctx.upstream_body() {
-                    Ok(b) => b,
-                    Err(e) => {
-                        execution.failed(&e);
-                        execution.delivered();
-                        yield executor_error_sse(&e);
-                        return;
-                    }
-                };
-                match send_request(
-                    &exec_ctx.client,
-                    upstream.url(),
-                    body,
-                    None,
-                    Some(upstream.headers()),
-                    exec_ctx.streaming_timeout,
-                )
+                match send_messages_round(&ctx, &exec_ctx, &upstream)
                 .instrument(round_span.clone())
                 .await
                 {
@@ -196,7 +181,9 @@ fn messages_stream_body(
 
             // Round finished. Continue only for a pure gateway-tool round; a
             // client-executed function tool makes the round terminal.
-            if !acc.should_continue_loop(&ctx) {
+            let should_continue = acc.should_continue_loop(&ctx);
+            let execute_terminal_mcp = acc.is_terminal_mcp_round();
+            if !should_continue && !execute_terminal_mcp {
                 execution.completed_with_stop_reason(acc.stop_reason());
                 let terminal = acc.finish();
                 execution.delivered();
@@ -209,14 +196,31 @@ fn messages_stream_body(
             // gateway tool_use, in order) for the next round's history — not just
             // the gateway tool_use (F3, streaming half). The gateway calls are
             // derived from the same buffered blocks for dispatch.
-            let (assistant_content, calls) = acc.take_round();
-            let allowed_searches = ctx.reserve_searches(calls.len());
+            let (assistant_content, mut calls) = if should_continue { acc.take_round() } else { acc.take_terminal_round() };
+            if execute_terminal_mcp { calls.retain(|call| acc.gateway_map.mcp_identity(&call.name).is_some()); }
+            let searches = calls.iter().filter(|call| acc.gateway_map.mcp_identity(&call.name).is_none()).count();
+            let allowed_searches = ctx.reserve_searches(searches);
             let tool_results = execute_gateway_calls(
                 &calls,
                 &registry,
-                &exec_ctx.messages_gateway_tools,
+                &acc.gateway_map,
                 allowed_searches,
             ).await;
+            match acc.emit_mcp_results(&assistant_content, &tool_results) {
+                Ok(frames) => { for frame in frames { yield frame; } }
+                Err(error) => {
+                    execution.failed(&error);
+                    execution.delivered();
+                    yield executor_error_sse(&error);
+                    return;
+                }
+            }
+            if execute_terminal_mcp {
+                execution.completed_with_stop_reason(acc.stop_reason());
+                execution.delivered();
+                for frame in acc.finish() { yield frame; }
+                return;
+            }
             if let Err(e) = ctx.append_round(&assistant_content, tool_results) {
                 execution.failed(&e);
                 execution.delivered();
@@ -273,6 +277,38 @@ struct MessagesStreamAccumulator {
 }
 
 impl MessagesStreamAccumulator {
+    fn emit_mcp_results(
+        &mut self,
+        content: &[Value],
+        results: &[crate::types::messages::GatewayToolResult],
+    ) -> ExecutorResult<Vec<String>> {
+        let mut frames = Vec::new();
+        for block in content {
+            if self.gateway_map.public_mcp_call(block).is_some() {
+                if let Some(result) = results.iter().find(|result| block["id"] == result.tool_use_id) {
+                    let result = serialize_to_value(&crate::types::messages::mcp::McpContentBlock::result(result))?;
+                    frames.extend(self.emit_block(&result));
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    fn emit_block(&mut self, block: &Value) -> Vec<String> {
+        let index = self.next_index;
+        self.next_index += 1;
+        vec![
+            sse(
+                "content_block_start",
+                &json!({"type":"content_block_start", "index":index, "content_block":block}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type":"content_block_stop", "index":index}),
+            ),
+        ]
+    }
+
     fn begin_round(&mut self) {
         self.index_map.clear();
         self.suppressed_indices.clear();
@@ -282,34 +318,6 @@ impl MessagesStreamAccumulator {
         // F6: clear the previous round's terminal so a clean-EOF round can't
         // re-emit a stale stop_reason.
         self.final_message_delta = None;
-    }
-
-    /// Number of gateway `tool_use` blocks buffered this round.
-    fn gateway_call_count(&self) -> usize {
-        self.blocks.values().filter(|b| b.is_gateway_tool).count()
-    }
-
-    /// Consume this round's buffered blocks, returning (full assistant content in
-    /// order, gateway calls to dispatch). The assistant content preserves
-    /// `thinking`/`text`/`signature` and the gateway `tool_use` blocks (F3); the
-    /// calls are the gateway `tool_use` blocks reconstructed for dispatch.
-    fn take_round(&mut self) -> (Vec<Value>, Vec<StreamedCall>) {
-        // This round's terminal is suppressed; its usage joins the final one's.
-        self.usage.commit();
-        let blocks = std::mem::take(&mut self.blocks);
-        let mut assistant_content = Vec::with_capacity(blocks.len());
-        let mut calls = Vec::new();
-        for buffered in blocks.values() {
-            assistant_content.push(buffered.to_block());
-            if buffered.is_gateway_tool {
-                calls.push(StreamedCall {
-                    id: buffered.block["id"].as_str().unwrap_or_default().to_owned(),
-                    name: buffered.block["name"].as_str().unwrap_or_default().to_owned(),
-                    input_json: buffered.input_json.clone(),
-                });
-            }
-        }
-        (assistant_content, calls)
     }
 
     /// The loop should continue only when the round asked for a gateway tool AND
@@ -404,21 +412,31 @@ impl MessagesStreamAccumulator {
             up_index,
             BufferedBlock {
                 block: event["content_block"].clone(),
-                input_json: String::new(),
+                input_json: if event["content_block"]["input"]
+                    .as_object()
+                    .is_some_and(|input| !input.is_empty())
+                {
+                    event["content_block"]["input"].to_string()
+                } else {
+                    String::new()
+                },
                 is_gateway_tool,
             },
         );
 
         if block_type == "tool_use" {
             if is_gateway_tool {
-                // Suppress gateway-owned tool_use from the client; it stays in the
-                // buffered history only and drives the loop.
-                self.suppressed_indices.insert(up_index);
-                return Vec::new();
+                if let Some(call) = self.gateway_map.public_mcp_call(&event["content_block"]) {
+                    if let Ok(call) = serialize_to_value(&call) {
+                        event["content_block"] = call;
+                    }
+                } else {
+                    self.suppressed_indices.insert(up_index);
+                    return Vec::new();
+                }
+            } else {
+                self.has_client_tool_use = true;
             }
-            // A client-owned tool_use: the client must execute it, so this round
-            // is terminal (E7). Forward it (below) and stop the loop.
-            self.has_client_tool_use = true;
         }
 
         // Forward with a rebased contiguous client index.

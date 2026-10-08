@@ -19,7 +19,7 @@ use crate::types::io::output::FunctionToolCall;
 use crate::types::tools::{
     FunctionToolParam, ResponsesTool, WebSearchFilters, WebSearchToolParam, WebSearchUserLocation,
 };
-use crate::utils::common::deserialize_from_value_opt;
+use crate::utils::common::{deserialize_from_value_opt, serialize_to_value};
 
 use super::request::{GatewayToolResult, ToolParam};
 
@@ -48,6 +48,7 @@ pub const NATIVE_WEB_SEARCH_TYPE: &str = "web_search_20250305";
 pub struct GatewayToolMap {
     /// client tool name (as the model calls it) → canonical executor key.
     aliases: HashMap<String, String>,
+    mcp_tools: HashMap<String, (String, String)>,
 }
 
 impl GatewayToolMap {
@@ -61,7 +62,48 @@ impl GatewayToolMap {
             .filter(|(name, exec)| !name.is_empty() && *exec == WEB_SEARCH_EXECUTOR)
             .map(|(name, exec)| (name.to_owned(), exec.to_owned()))
             .collect();
-        Self { aliases }
+        Self {
+            aliases,
+            mcp_tools: HashMap::new(),
+        }
+    }
+
+    /// Register metadata for an enabled MCP tool discovered by the shared registry.
+    pub(crate) fn insert_mcp(&mut self, internal: String, server: String, tool: String) {
+        self.mcp_tools.insert(internal, (server, tool));
+    }
+
+    #[must_use]
+    pub fn mcp_identity(&self, name: &str) -> Option<(&str, &str)> {
+        self.mcp_tools
+            .get(name)
+            .map(|(server, tool)| (server.as_str(), tool.as_str()))
+    }
+
+    pub(crate) fn mcp_internal_name(&self, server: &str, tool: &str) -> Option<&str> {
+        self.mcp_tools
+            .iter()
+            .find(|(_, identity)| identity.0 == server && identity.1 == tool)
+            .map(|(name, _)| name.as_str())
+    }
+
+    pub(crate) fn mcp_names(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.mcp_tools
+            .iter()
+            .map(|(name, (server, tool))| (name.as_str(), server.as_str(), tool.as_str()))
+    }
+
+    pub(crate) fn public_mcp_call(&self, block: &Value) -> Option<super::mcp::McpContentBlock> {
+        if block["type"] != "tool_use" {
+            return None;
+        }
+        let (server, tool) = self.mcp_identity(block["name"].as_str()?)?;
+        Some(super::mcp::McpContentBlock::McpToolUse {
+            id: block["id"].as_str()?.to_owned(),
+            name: tool.to_owned(),
+            server_name: server.to_owned(),
+            input: block["input"].clone(),
+        })
     }
 
     /// Parse the `MESSAGES_GATEWAY_TOOL_ALIASES` env format:
@@ -76,6 +118,9 @@ impl GatewayToolMap {
     /// gateway-owned: the built-in `web_search`, or a configured alias.
     #[must_use]
     pub fn canonical_executor(&self, name: &str) -> Option<&str> {
+        if self.mcp_tools.contains_key(name) {
+            return None;
+        }
         if name == WEB_SEARCH_EXECUTOR {
             Some(WEB_SEARCH_EXECUTOR)
         } else {
@@ -85,7 +130,7 @@ impl GatewayToolMap {
 
     #[must_use]
     pub fn is_gateway_owned(&self, name: &str) -> bool {
-        self.canonical_executor(name).is_some()
+        self.canonical_executor(name).is_some() || self.mcp_tools.contains_key(name)
     }
 }
 
@@ -94,7 +139,11 @@ impl GatewayToolMap {
 /// against the operator-configured [`GatewayToolMap`].
 #[must_use]
 pub fn has_gateway_tool(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) -> bool {
-    tools.is_some_and(|tools| tools.iter().any(|t| map.is_gateway_owned(&t.name)))
+    tools.is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| t.type_.as_deref() == Some("mcp_toolset") || map.is_gateway_owned(&t.name))
+    })
 }
 
 /// Map declared Anthropic tools to the internal `ResponsesTool` list used to
@@ -112,6 +161,9 @@ pub fn registry_tools(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) -> V
 }
 
 fn map_tool(tool: &ToolParam, map: &GatewayToolMap) -> Option<ResponsesTool> {
+    if tool.type_.as_deref() == Some("mcp_toolset") {
+        return None;
+    }
     if map.canonical_executor(&tool.name) == Some(WEB_SEARCH_EXECUTOR) {
         return Some(ResponsesTool::WebSearch(web_search_config(tool)));
     }
@@ -121,7 +173,7 @@ fn map_tool(tool: &ToolParam, map: &GatewayToolMap) -> Option<ResponsesTool> {
         description: tool.description.clone(),
         parameters: tool.input_schema.clone(),
         strict: None,
-        defer_loading: None,
+        defer_loading: tool.defer_loading,
         extra: std::collections::HashMap::new(),
     }))
 }
@@ -251,6 +303,35 @@ pub fn strip_gateway_tool_use(content: &[Value], map: &GatewayToolMap) -> Vec<Va
         })
         .cloned()
         .collect()
+}
+
+/// Project a completed gateway round while preserving visible block order.
+pub(crate) fn project_mcp_round(
+    content: &[Value],
+    results: &[GatewayToolResult],
+    map: &GatewayToolMap,
+    include_visible: bool,
+) -> Result<Vec<Value>, serde_json::Error> {
+    let mut projected = Vec::new();
+    for block in content {
+        if let Some(call) = map.public_mcp_call(block) {
+            projected.push(serialize_to_value(&call)?);
+        } else if include_visible
+            && !(block["type"] == "tool_use" && map.is_gateway_owned(block["name"].as_str().unwrap_or_default()))
+        {
+            projected.push(block.clone());
+        }
+    }
+    // Inference produces the entire assistant round before execution begins,
+    // matching the streaming path's call blocks followed by completed outputs.
+    for block in content {
+        if map.public_mcp_call(block).is_some() {
+            if let Some(result) = results.iter().find(|result| block["id"] == result.tool_use_id) {
+                projected.push(serialize_to_value(&super::mcp::McpContentBlock::result(result))?);
+            }
+        }
+    }
+    Ok(projected)
 }
 
 /// Build the assistant `tool_use` content block that mirrors a call the gateway
