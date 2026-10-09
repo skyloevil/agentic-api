@@ -268,3 +268,91 @@ fn normalize_replayed_mcp_block(
         _ => Ok(false),
     }
 }
+
+/// Recognize an unresolved mixed turn before replay normalization loses MCP identity.
+/// Historical completed calls never become execution grants.
+pub(super) fn pending_mcp_calls(
+    raw: &Value,
+    map: &GatewayToolMap,
+) -> ExecutorResult<Vec<crate::types::messages::mcp::PendingMcpCall>> {
+    use crate::types::messages::mcp::PendingMcpCall;
+    use std::collections::{HashMap, HashSet};
+
+    let invalid = || {
+        ExecutorError::InvalidRequest("invalid pending MCP continuation: provide all matching client tool_result blocks immediately after the mixed assistant turn".to_owned())
+    };
+    let Some(messages) = raw["messages"].as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut pending = HashMap::new();
+    let mut seen = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        for block in message["content"].as_array().into_iter().flatten() {
+            match block["type"].as_str() {
+                Some("mcp_tool_use") => {
+                    let call = PendingMcpCall::deserialize(block).map_err(|_| invalid())?;
+                    if message["role"] != "assistant"
+                        || call.id.is_empty()
+                        || call.name.is_empty()
+                        || call.server_name.is_empty()
+                        || !seen.insert(call.id.clone())
+                    {
+                        return Err(invalid());
+                    }
+                    pending.insert(call.id.clone(), (index, call));
+                }
+                Some("mcp_tool_result") => {
+                    if let Some(id) = block["tool_use_id"].as_str() {
+                        pending.remove(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let assistant_index = messages.len().checked_sub(2).ok_or_else(invalid)?;
+    if pending.values().any(|(index, _)| *index != assistant_index)
+        || messages[assistant_index]["role"] != "assistant"
+        || messages[assistant_index + 1]["role"] != "user"
+    {
+        return Err(invalid());
+    }
+    let assistant = messages[assistant_index]["content"].as_array().ok_or_else(invalid)?;
+    let mut clients = HashSet::new();
+    for block in assistant.iter().filter(|block| block["type"] == "tool_use") {
+        let name = block["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(invalid)?;
+        if !map.is_gateway_owned(name) {
+            let id = block["id"].as_str().filter(|id| !id.is_empty()).ok_or_else(invalid)?;
+            if seen.contains(id) || !clients.insert(id) {
+                return Err(invalid());
+            }
+        }
+    }
+    let results = messages[assistant_index + 1]["content"]
+        .as_array()
+        .ok_or_else(invalid)?;
+    if clients.is_empty() || results.len() != clients.len() {
+        return Err(invalid());
+    }
+    for result in results {
+        if result["type"] != "tool_result" || !result["tool_use_id"].as_str().is_some_and(|id| clients.remove(id)) {
+            return Err(invalid());
+        }
+    }
+    // Preserve the assistant's call order rather than HashMap iteration order.
+    Ok(assistant
+        .iter()
+        .filter_map(|block| {
+            block["id"]
+                .as_str()
+                .and_then(|id| pending.remove(id))
+                .map(|(_, call)| call)
+        })
+        .collect())
+}

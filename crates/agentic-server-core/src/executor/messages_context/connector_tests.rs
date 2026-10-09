@@ -255,6 +255,13 @@ async fn mcp_calls_and_errors_use_the_same_loop_in_both_response_modes() {
                 assert_eq!(call["id"], "call");
                 assert_eq!(call["server_name"], "counter");
                 assert_eq!(call["name"], if failed { "fail" } else { "echo" });
+                if mixed {
+                    assert!(!content.iter().any(|block| block["type"] == "mcp_tool_result"));
+                    assert_eq!(requests.lock().await.len(), 1);
+                    task.abort();
+                    let _ = task.await;
+                    continue;
+                }
                 let result = content.iter().find(|block| block["type"] == "mcp_tool_result").unwrap();
                 assert_eq!(result["tool_use_id"], "call");
                 assert_eq!(result["is_error"], failed);

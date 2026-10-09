@@ -85,7 +85,16 @@ impl MessagesStreamAccumulator {
             return Vec::new();
         }
         self.message_started = true;
-        vec![sse("message_start", event)]
+        let mut frames = vec![sse("message_start", event)];
+        for result in std::mem::take(&mut self.pending_mcp_results) {
+            if let Ok(block) = serde_json::to_value(crate::types::messages::mcp::McpContentBlock::result(&result)) {
+                frames.extend(self.emit_block(&block));
+            } else {
+                frames.extend(self.fail("could not project resumed MCP result"));
+                break;
+            }
+        }
+        frames
     }
 
     fn on_block_start(&mut self, event: &mut Value) -> Vec<String> {

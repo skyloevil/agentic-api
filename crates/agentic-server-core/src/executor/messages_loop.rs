@@ -115,7 +115,14 @@ async fn run_messages_loop_traced(
     ctx.force_stream(false);
     let mut usage = MessagesUsageTotals::default();
     let gateway_map = request_gateway_map(ctx.gateway_tools_or(&exec_ctx.messages_gateway_tools), registry);
-    let mut public_content = Vec::new();
+    let resumed = super::messages_tools::resume_pending_mcp(&mut ctx, registry, &gateway_map).await?;
+    let mut public_content = resumed
+        .iter()
+        .map(|result| {
+            serde_json::to_value(crate::types::messages::mcp::McpContentBlock::result(result))
+                .map_err(ExecutorError::JsonError)
+        })
+        .collect::<ExecutorResult<Vec<_>>>()?;
 
     for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
         let body = ctx.upstream_body()?;
@@ -163,22 +170,12 @@ async fn run_messages_loop_traced(
             // Client execution takes precedence even when the provider labels a
             // named call end_turn. `deliver` keeps the hidden gateway calls out.
             execution.completed_with_stop_reason(stop_reason);
-            let projected = complete_mcp_calls_in_client_round(
-                content,
-                stop_reason,
-                gateway_calls,
-                &mut ctx,
-                registry,
-                gateway_map,
-            )
-            .await?;
+            let projected = tool_seam::project_mcp_round(content, &[], gateway_map, true)?;
             let mut message = message;
             if message["stop_reason"] == "end_turn" {
                 message["stop_reason"] = json!("tool_use");
             }
-            if let Some(content) = projected {
-                message["content"] = content;
-            }
+            message["content"] = Value::Array(projected);
             return Ok(deliver(
                 message,
                 &mut usage,
@@ -261,35 +258,6 @@ fn split_gateway_calls(content: &[Value], gateway_map: &tool_seam::GatewayToolMa
     }
 
     (gateway_calls, has_client_tool_use)
-}
-
-async fn complete_mcp_calls_in_client_round(
-    content: &[Value],
-    stop_reason: Option<&str>,
-    mut gateway_calls: Vec<Value>,
-    ctx: &mut MessagesRequestContext,
-    registry: &ToolRegistry,
-    gateway_map: &tool_seam::GatewayToolMap,
-) -> ExecutorResult<Option<Value>> {
-    gateway_calls.retain(|call| {
-        gateway_map
-            .mcp_identity(call["name"].as_str().unwrap_or_default())
-            .is_some()
-    });
-    if gateway_calls.is_empty() {
-        return Ok(None);
-    }
-    let results = if matches!(stop_reason, Some("tool_use" | "end_turn")) {
-        execute_gateway_calls(tool_uses(&gateway_calls), ctx, registry, gateway_map).await
-    } else {
-        Vec::new()
-    };
-    Ok(Some(Value::Array(tool_seam::project_mcp_round(
-        content,
-        &results,
-        gateway_map,
-        true,
-    )?)))
 }
 
 /// Return the terminal assistant message with the turn's complete `usage` and

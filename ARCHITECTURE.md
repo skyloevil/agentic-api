@@ -1142,9 +1142,11 @@ request context accepts that stop only when the selected gateway tool appears in
 the round. Streaming additionally requires `message_stop`; client-executed
 function tools and truncated rounds remain terminal. A completed client-executed
 `tool_use` is surfaced with public `stop_reason: tool_use`, correcting vLLM's
-`end_turn` in JSON and the final SSE `message_delta`. Mixed rounds complete MCP
-calls and return their public blocks alongside the client-executed calls; web-search
-calls remain hidden. Token limits, other stop reasons and streams
+`end_turn` in JSON and the final SSE `message_delta`. Mixed rounds return pending MCP calls alongside client-executed calls without
+executing them; web-search calls remain hidden. A continuation containing all matching
+client `tool_result` blocks resumes the pending MCP calls against the current registry
+before inference. Their public results lead the new response and refer to the previous
+call IDs. Completed historical calls do not run again. Token limits, other stop reasons and streams
 without a completed round keep their original terminal semantics.
 
 For web search, hide-the-call covers every terminal round, not only a mixed one. A round can end while a

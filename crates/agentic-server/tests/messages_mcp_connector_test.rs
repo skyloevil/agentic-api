@@ -407,8 +407,254 @@ async fn malformed_streams_never_dispatch_mcp_calls() {
     mcp.stop().await;
 }
 
+/// Reconstruct the actual client-visible message, including fragmented MCP arguments.
+fn response_content(response: &str, stream: bool) -> Vec<Value> {
+    if !stream {
+        return serde_json::from_str::<Value>(response).unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .clone();
+    }
+    let mut blocks = std::collections::BTreeMap::new();
+    let mut inputs = std::collections::HashMap::<u64, String>::new();
+    let mut stops = std::collections::HashSet::new();
+    let mut terminal = false;
+    for event in response
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<Value>(data).unwrap())
+    {
+        match event["type"].as_str().unwrap() {
+            "content_block_start" => {
+                assert!(
+                    blocks
+                        .insert(event["index"].as_u64().unwrap(), event["content_block"].clone())
+                        .is_none()
+                );
+            }
+            "content_block_delta" => {
+                let index = event["index"].as_u64().unwrap();
+                match event["delta"]["type"].as_str().unwrap() {
+                    "input_json_delta" => inputs
+                        .entry(index)
+                        .or_default()
+                        .push_str(event["delta"]["partial_json"].as_str().unwrap()),
+                    "text_delta" => {
+                        let block = blocks.get_mut(&index).unwrap();
+                        let text = format!(
+                            "{}{}",
+                            block["text"].as_str().unwrap_or_default(),
+                            event["delta"]["text"].as_str().unwrap()
+                        );
+                        block["text"] = json!(text);
+                    }
+                    other => panic!("unexpected delta {other}"),
+                }
+            }
+            "content_block_stop" => {
+                assert!(stops.insert(event["index"].as_u64().unwrap()));
+            }
+            "message_stop" => {
+                assert!(!terminal);
+                terminal = true;
+            }
+            "error" => panic!("unexpected stream error: {event}"),
+            _ => {}
+        }
+    }
+    assert!(terminal);
+    assert_eq!(blocks.len(), stops.len());
+    assert_eq!(
+        blocks.keys().copied().collect::<Vec<_>>(),
+        (0..blocks.len() as u64).collect::<Vec<_>>()
+    );
+    for (index, input) in inputs {
+        blocks.get_mut(&index).unwrap()["input"] = serde_json::from_str(&input).unwrap();
+    }
+    blocks.into_values().collect()
+}
+
+async fn call_count(mcp: &fixture::HttpsMcp) -> usize {
+    mcp.observations()
+        .await
+        .iter()
+        .filter(|entry| entry["method"] == "tools/call")
+        .count()
+}
+
 #[tokio::test]
-async fn mixed_calls_resume_with_client_output_without_reexecuting_mcp() {
+async fn mixed_calls_wait_for_client_output_before_executing_mcp() {
+    let mcp = fixture::HttpsMcp::start().await;
+    let (url, requests, task) = fixture::inference().await;
+    let router = build_router(
+        common::test_state(&common::test_config(&url)),
+        &ServerConfig::from_env(),
+    );
+    // Include transport changes between initial response and continuation.
+    for initial_stream in [false, true] {
+        for stream in [false, true] {
+            let mut body = request(&mcp.url, initial_stream, "mixed");
+            body["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name":"client_echo","input_schema":{"type":"object"}}));
+            body["tool_choice"] = json!({"type":"any","disable_parallel_tool_use":false,"extension":"preserved"});
+            let before_calls = call_count(&mcp).await;
+            let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            let content = response_content(&response, initial_stream);
+            assert_eq!(
+                content
+                    .iter()
+                    .map(|block| block["type"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["mcp_tool_use", "tool_use"]
+            );
+            assert_eq!(content[0]["input"], json!({"text":"hello"}));
+            assert_eq!(
+                call_count(&mcp).await,
+                before_calls,
+                "initial mixed response must not execute MCP"
+            );
+            if !initial_stream {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response).unwrap()["stop_reason"],
+                    "tool_use"
+                );
+            }
+            body["stream"] = json!(stream);
+            body["messages"].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":content}),
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"client","content":"client output"}]}),
+            ]);
+            let before = requests.lock().await.len();
+            let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(call_count(&mcp).await, before_calls + 1);
+            let continued = response_content(&response, stream);
+            assert_eq!(
+                continued
+                    .iter()
+                    .map(|block| block["type"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["mcp_tool_result", "text"]
+            );
+            assert_eq!(continued[0]["tool_use_id"], "call");
+            assert_eq!(continued[0]["is_error"], false);
+            assert!(
+                continued[0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fixture output: hello")
+            );
+            {
+                let captured = requests.lock().await;
+                assert_eq!(captured.len(), before + 1);
+                assert_eq!(
+                    captured.last().unwrap()["tool_choice"],
+                    json!({"type":"auto","disable_parallel_tool_use":false,"extension":"preserved"})
+                );
+                let history = captured.last().unwrap()["messages"].as_array().unwrap();
+                assert_eq!(history.len(), 3);
+                assert_eq!(history[1]["content"][0]["name"], "mcp__counter__echo");
+                assert_eq!(history[1]["content"][1]["name"], "client_echo");
+                assert_eq!(history[2]["content"][0]["tool_use_id"], "client");
+                assert_eq!(history[2]["content"][1]["tool_use_id"], "call");
+            }
+            body["messages"].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":continued}),
+                json!({"role":"user","content":"continue"}),
+            ]);
+            let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(
+                call_count(&mcp).await,
+                before_calls + 1,
+                "completed history must not execute MCP again"
+            );
+            assert!(
+                !response_content(&response, stream)
+                    .iter()
+                    .any(|block| block["type"] == "mcp_tool_result")
+            );
+        }
+    }
+    task.abort();
+    let _ = task.await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_mixed_continuations_never_execute_mcp_or_start_inference() {
+    let mcp = fixture::HttpsMcp::start().await;
+    let (url, requests, task) = fixture::inference().await;
+    let router = build_router(
+        common::test_state(&common::test_config(&url)),
+        &ServerConfig::from_env(),
+    );
+    for stream in [false, true] {
+        for mode in [
+            "missing",
+            "wrong_id",
+            "duplicate",
+            "text",
+            "removed",
+            "disabled",
+            "bad_input",
+            "old_pending",
+        ] {
+            let mut body = request(&mcp.url, stream, "mixed");
+            body["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name":"client_echo","input_schema":{"type":"object"}}));
+            body["messages"].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":[
+                    {"type":"mcp_tool_use","id":"call","server_name":"counter","name":"echo","input":{"text":"hello"}},
+                    {"type":"tool_use","id":"client","name":"client_echo","input":{}}
+                ]}),
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"client","content":"client output"}]}),
+            ]);
+            match mode {
+                "missing" => body["messages"][2]["content"] = json!([]),
+                "wrong_id" => body["messages"][2]["content"][0]["tool_use_id"] = json!("wrong"),
+                "duplicate" => {
+                    let result = body["messages"][2]["content"][0].clone();
+                    body["messages"][2]["content"].as_array_mut().unwrap().push(result);
+                }
+                "text" => body["messages"][2]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type":"text","text":"extra"})),
+                "removed" => {
+                    body.as_object_mut().unwrap().remove("mcp_servers");
+                    body["tools"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|tool| tool["type"] != "mcp_toolset");
+                }
+                "disabled" => body["tools"][1]["configs"]["echo"]["enabled"] = json!(false),
+                "bad_input" => body["messages"][1]["content"][0]["input"] = json!("broken"),
+                "old_pending" => body["messages"].as_array_mut().unwrap().extend([
+                    json!({"role":"assistant","content":"another turn"}),
+                    json!({"role":"user","content":"continue"}),
+                ]),
+                _ => unreachable!(),
+            }
+            let before = requests.lock().await.len();
+            let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{mode}: {response}");
+            assert_eq!(requests.lock().await.len(), before, "{mode}");
+            assert_eq!(call_count(&mcp).await, 0, "{mode}");
+        }
+    }
+    task.abort();
+    let _ = task.await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn multiple_pending_calls_resume_in_order_with_failures_and_complete_client_results() {
     let mcp = fixture::HttpsMcp::start().await;
     let (url, requests, task) = fixture::inference().await;
     let router = build_router(
@@ -417,65 +663,52 @@ async fn mixed_calls_resume_with_client_output_without_reexecuting_mcp() {
     );
     for stream in [false, true] {
         let mut body = request(&mcp.url, stream, "mixed");
-        body["tools"]
+        for name in ["client_echo", "client_other"] {
+            body["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name":name,"input_schema":{"type":"object"}}));
+        }
+        body["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":[
+                {"type":"mcp_tool_use","id":"call","server_name":"counter","name":"echo","input":{"text":"first"}},
+                {"type":"tool_use","id":"client","name":"client_echo","input":{}},
+                {"type":"mcp_tool_use","id":"failure","server_name":"counter","name":"fail","input":{"text":"second"}},
+                {"type":"tool_use","id":"client2","name":"client_other","input":{}}
+            ]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"client","content":"one"}]}),
+        ]);
+        let before = call_count(&mcp).await;
+        let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "partial client results: {response}");
+        assert_eq!(call_count(&mcp).await, before);
+        body["messages"][2]["content"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"name":"client_echo","input_schema":{"type":"object"}}));
+            .push(json!({"type":"tool_result","tool_use_id":"client2","content":"two","is_error":true}));
         let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
         assert_eq!(status, StatusCode::OK, "{response}");
-        let content = if stream {
-            response
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .map(|data| serde_json::from_str::<Value>(data).unwrap())
-                .filter(|event| event["type"] == "content_block_start")
-                .map(|event| {
-                    let mut block = event["content_block"].clone();
-                    if block["type"] == "mcp_tool_use" {
-                        block["input"] = json!({"text":"hello"});
-                    }
-                    block
-                })
-                .collect::<Vec<_>>()
-        } else {
-            serde_json::from_str::<Value>(&response).unwrap()["content"]
-                .as_array()
-                .unwrap()
-                .clone()
-        };
-        assert_eq!(
-            content
-                .iter()
-                .map(|block| block["type"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["mcp_tool_use", "tool_use", "mcp_tool_result"]
-        );
-        body["messages"].as_array_mut().unwrap().extend([
-            json!({"role":"assistant","content":content}),
-            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"client","content":"client output"}]}),
-        ]);
-        let before = requests.lock().await.len();
-        let (status, response) = trusted_post(&router, "/v1/messages", &body, &mcp.certificate).await;
-        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(call_count(&mcp).await, before + 2);
+        let content = response_content(&response, stream);
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "mcp_tool_result");
+        assert_eq!(content[0]["tool_use_id"], "call");
+        assert_eq!(content[0]["is_error"], false);
+        assert_eq!(content[1]["type"], "mcp_tool_result");
+        assert_eq!(content[1]["tool_use_id"], "failure");
+        assert_eq!(content[1]["is_error"], true);
         let captured = requests.lock().await;
-        assert_eq!(captured.len(), before + 1);
-        let history = captured.last().unwrap()["messages"].as_array().unwrap();
-        assert_eq!(history[1]["role"], "assistant");
-        assert_eq!(history[1]["content"][0]["name"], "mcp__counter__echo");
-        assert_eq!(history[1]["content"][1]["name"], "client_echo");
-        assert_eq!(history[2]["role"], "user");
-        assert_eq!(history[2]["content"][0]["tool_use_id"], "call");
-        assert_eq!(history[3]["role"], "user");
-        assert_eq!(history[3]["content"][0]["tool_use_id"], "client");
+        let results = captured.last().unwrap()["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result["tool_use_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["client", "client2", "call", "failure"]
+        );
+        assert_eq!(results[1]["is_error"], true);
+        assert_eq!(results[3]["is_error"], true);
     }
-    assert_eq!(
-        mcp.observations()
-            .await
-            .iter()
-            .filter(|entry| entry["method"] == "tools/call")
-            .count(),
-        2
-    );
     task.abort();
     let _ = task.await;
     mcp.stop().await;

@@ -133,18 +133,3 @@ impl super::MessagesStreamAccumulator {
         self.blocks.values().filter(|b| b.is_gateway_tool).count()
     }
 }
-
-impl super::MessagesStreamAccumulator {
-    pub(super) fn is_terminal_mcp_round(&self) -> bool {
-        self.has_completed_round()
-            && matches!(self.stop_reason(), Some("tool_use" | "end_turn"))
-            && self.has_client_tool_use
-            && self.blocks.values().any(|block| {
-                block.is_gateway_tool
-                    && self
-                        .gateway_map
-                        .mcp_identity(block.block["name"].as_str().unwrap_or_default())
-                        .is_some()
-            })
-    }
-}

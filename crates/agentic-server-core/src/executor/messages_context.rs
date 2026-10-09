@@ -33,6 +33,8 @@
 //! deliberately unreachable through it, so a stale typed view can never be read
 //! back after a round is appended.
 
+mod continuation;
+
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -160,6 +162,7 @@ pub struct MessagesRequestContext {
     /// Request-wide native server-tool budgets, derived while normalizing `raw`.
     budgets: ServerToolBudgets,
     gateway_tools: Option<GatewayToolMap>,
+    pending_mcp: Vec<crate::types::messages::mcp::PendingMcpCall>,
 }
 
 /// Whether `text` mentions `url` as a whole URL rather than as the prefix of a
@@ -241,6 +244,7 @@ impl MessagesRequestContext {
             raw,
             budgets,
             gateway_tools: None,
+            pending_mcp: Vec::new(),
         })
     }
 
@@ -270,8 +274,24 @@ impl MessagesRequestContext {
         )?);
         let registry = crate::tool::ToolRegistry::build_with_handlers(&mut tools, executors).await?;
         super::messages_connector::validate_connector_discovery(&registry)?;
+        let mut pending = super::messages_connector::pending_mcp_calls(
+            &self.raw,
+            &super::messages_tools::request_gateway_map(map, &registry),
+        )?;
         let mut gateway_tools = map.clone();
         normalize_connector(&mut self.raw, &tools, &mut gateway_tools)?;
+        for call in &mut pending {
+            let name = gateway_tools
+                .mcp_internal_name(&call.server_name, &call.name)
+                .filter(|name| registry.lookup(name).is_some_and(|entry| entry.ownership.is_gateway()))
+                .ok_or_else(|| {
+                    ExecutorError::InvalidRequest(
+                        "pending MCP tool must remain enabled in the continuation request".to_owned(),
+                    )
+                })?;
+            call.name = name.to_owned();
+        }
+        self.pending_mcp = pending;
         self.gateway_tools = Some(gateway_tools);
         Ok(registry)
     }
@@ -425,17 +445,7 @@ impl MessagesRequestContext {
             serde_json::to_value(tool_results).map_err(ExecutorError::JsonError)?,
         );
         messages.push(Value::Object(user));
-        if fulfilled_choice {
-            if let Some(choice) = &mut self.tool_choice {
-                match choice {
-                    MessagesToolChoice::Any(options) | MessagesToolChoice::Tool { options, .. } => {
-                        *choice = MessagesToolChoice::Auto(std::mem::take(options));
-                    }
-                    MessagesToolChoice::Auto(_) | MessagesToolChoice::None { .. } => {}
-                }
-                self.raw["tool_choice"] = serde_json::to_value(choice).map_err(ExecutorError::JsonError)?;
-            }
-        }
+        self.relax_fulfilled_choice(fulfilled_choice)?;
         Ok(())
     }
 }

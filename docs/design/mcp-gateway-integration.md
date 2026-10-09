@@ -255,8 +255,12 @@ The connector does not supply a tool search executor of its own.
 
 Both JSON and streaming responses expose completed MCP execution as `mcp_tool_use` and `mcp_tool_result` blocks,
 with the original MCP tool name, server name, matching call ID, textual output, and `is_error` marker. Other function
-tools remain client-executed. When a round contains both kinds, the gateway executes its MCP calls and returns the
-client function calls for client execution. Replayed MCP blocks are lowered to upstream `tool_use` / `tool_result`
+tools remain client-executed. When a round contains both kinds, the gateway returns
+`stop_reason: "tool_use"` with pending MCP calls and client function calls, without executing MCP.
+The next request must preserve the mixed assistant content and immediately supply a user message
+containing only matching `tool_result` blocks for every client call. Pending MCP tools must remain
+enabled. The gateway then executes them before inference and starts the new response with their
+`mcp_tool_result` blocks, retaining the prior call IDs without repeating the calls. Replayed MCP blocks are lowered to upstream `tool_use` / `tool_result`
 history, with MCP outputs moved into user messages. Historical calls remain replayable after their tool or server
 is disabled or removed; replay does not grant execution permission. Hosted search references to removed definitions
 are dropped during replay. `/v1/messages/count_tokens` uses the same declaration discovery

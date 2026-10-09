@@ -238,6 +238,32 @@ fn content(body: &Value) -> Vec<Value> {
             .as_array()
             .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
     }) {
+        if body["model"] == "mixed" {
+            let results = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                .filter(|block| block["type"] == "tool_result")
+                .collect::<Vec<_>>();
+            assert!(results.iter().any(|block| block["tool_use_id"] == "client"));
+            assert!(
+                results.iter().any(|block| block["tool_use_id"] == "call"),
+                "MCP output must be present before inference"
+            );
+            for call in body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                .filter(|block| block["type"] == "tool_use")
+            {
+                assert!(
+                    results.iter().any(|result| result["tool_use_id"] == call["id"]),
+                    "every call needs its output before inference"
+                );
+            }
+        }
         return vec![json!({"type":"text","text":"done"})];
     }
     let failed = body["model"] == "fail";

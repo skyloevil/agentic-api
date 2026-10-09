@@ -69,6 +69,17 @@ impl McpToolsetConfig {
     }
 }
 
+/// A pending connector call carried by a mixed-turn continuation.
+/// Object arguments are retained verbatim; execution identity is resolved against
+/// the current request registry before this call can be dispatched.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PendingMcpCall {
+    pub id: String,
+    pub name: String,
+    pub server_name: String,
+    pub input: serde_json::Map<String, Value>,
+}
+
 /// Public Messages projections; execution and call IDs stay in the shared tool path.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

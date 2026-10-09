@@ -62,6 +62,15 @@ pub async fn run_messages_stream(
     let mut execution = ExecutionSpan::start(Api::Messages, Route::Executor, true);
     let span = execution.span().clone();
     let first_round = span.in_scope(|| super::telemetry::stages::inference_round(0));
+    let gateway_map = request_gateway_map(ctx.gateway_tools_or(&exec_ctx.messages_gateway_tools), &registry);
+    let resumed = match super::messages_tools::resume_pending_mcp(&mut ctx, &registry, &gateway_map).await {
+        Ok(results) => results,
+        Err(error) => {
+            execution.failed(&error);
+            execution.not_delivered();
+            return Err(error);
+        }
+    };
     let primed = send_messages_round(&ctx, &exec_ctx, &upstream)
         .instrument(first_round.clone())
         .await;
@@ -81,6 +90,7 @@ pub async fn run_messages_stream(
         upstream,
         (first_response, first_round),
         execution,
+        resumed,
     );
     Ok(MessagesResponse {
         body: Box::pin(InstrumentedStream::new(body, span)),
@@ -117,10 +127,12 @@ fn messages_stream_body(
     upstream: MessagesUpstream,
     first_response: (reqwest::Response, tracing::Span),
     mut execution: ExecutionSpan,
+    resumed: Vec<crate::types::messages::GatewayToolResult>,
 ) -> BoxStream {
     Box::pin(stream! {
         let mut acc = MessagesStreamAccumulator {
             gateway_map: request_gateway_map(ctx.gateway_tools_or(&exec_ctx.messages_gateway_tools), &registry),
+            pending_mcp_results: resumed,
             ..Default::default()
         };
         let mut prepared_response = Some(first_response);
@@ -179,8 +191,7 @@ fn messages_stream_body(
             // Round finished. Continue only for a pure gateway-tool round; a
             // client-executed function tool makes the round terminal.
             let should_continue = acc.should_continue_loop(&ctx);
-            let execute_terminal_mcp = acc.is_terminal_mcp_round();
-            if !should_continue && !execute_terminal_mcp {
+            if !should_continue {
                 execution.completed_with_stop_reason(acc.stop_reason());
                 let terminal = acc.finish();
                 execution.delivered();
@@ -193,8 +204,7 @@ fn messages_stream_body(
             // gateway tool_use, in order) for the next round's history — not just
             // the gateway tool_use (F3, streaming half). The gateway calls are
             // derived from the same buffered blocks for dispatch.
-            let (assistant_content, mut calls) = if should_continue { acc.take_round() } else { acc.take_terminal_round() };
-            if execute_terminal_mcp { calls.retain(|call| acc.gateway_map.mcp_identity(&call.name).is_some()); }
+            let (assistant_content, calls) = acc.take_round();
             let tool_results = execute_gateway_calls(
                 &calls,
                 &mut ctx,
@@ -209,12 +219,6 @@ fn messages_stream_body(
                     yield executor_error_sse(&error);
                     return;
                 }
-            }
-            if execute_terminal_mcp {
-                execution.completed_with_stop_reason(acc.stop_reason());
-                execution.delivered();
-                for frame in acc.finish() { yield frame; }
-                return;
             }
             if let Err(e) = ctx.append_round(&assistant_content, tool_results) {
                 execution.failed(&e);
@@ -245,6 +249,7 @@ enum RoundState {
 #[derive(Default)]
 struct MessagesStreamAccumulator {
     message_started: bool,
+    pending_mcp_results: Vec<crate::types::messages::GatewayToolResult>,
     /// Whether the current upstream round has supplied its `message_start`.
     round_started: bool,
     /// Next client-visible block index (contiguous across rounds).
