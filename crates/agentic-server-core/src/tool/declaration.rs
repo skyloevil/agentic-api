@@ -13,9 +13,7 @@
 //! here, in [`ToolDeclaration::WebFetch`].
 
 use crate::types::messages::request::ToolParam;
-use crate::types::messages::tool_seam::{
-    GatewayToolMap, NATIVE_WEB_SEARCH_VERSIONS, NativeToolVersion, WEB_SEARCH_EXECUTOR, is_native_web_fetch_type,
-};
+use crate::types::messages::tool_seam::{GatewayToolMap, WEB_SEARCH_EXECUTOR, is_native_web_fetch_type};
 use crate::types::tools::{
     CodeInterpreterToolParam, CodexNamespaceToolParam, CustomToolParam, DomainFilters, FileSearchToolParam,
     FunctionToolParam, McpToolParam, ResponsesTool, ShellToolParam, ToolSearchToolParam, WebFetchToolParam,
@@ -127,17 +125,27 @@ pub fn registry_tools(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) -> V
 }
 
 fn map_tool(tool: &ToolParam, map: &GatewayToolMap) -> Option<ToolDeclaration> {
-    if is_native_web_fetch_type(tool.type_.as_deref()) {
-        return web_fetch_config(tool).map(ToolDeclaration::WebFetch);
+    match tool {
+        ToolParam::WebFetch(_) => web_fetch_config(tool).map(ToolDeclaration::WebFetch),
+        // Keep unsupported fetch versions on the validation path; they must not
+        // become client tools and bypass the existing version rejection.
+        ToolParam::Provider(provider) if is_native_web_fetch_type(Some(&provider.tool_type)) => {
+            web_fetch_config(tool).map(ToolDeclaration::WebFetch)
+        }
+        ToolParam::Function(_) | ToolParam::WebSearch(_) | ToolParam::Provider(_) => map_named_tool(tool, map),
     }
-    if map.canonical_executor(&tool.name) == Some(WEB_SEARCH_EXECUTOR) {
+}
+
+fn map_named_tool(tool: &ToolParam, map: &GatewayToolMap) -> Option<ToolDeclaration> {
+    if map.canonical_executor(tool.name()) == Some(WEB_SEARCH_EXECUTOR) {
         return Some(ToolDeclaration::WebSearch(web_search_config(tool)));
     }
-    let name = tool.name.clone().try_into().ok()?;
+    let fields = tool.fields();
+    let name = tool.name().try_into().ok()?;
     Some(ToolDeclaration::Function(FunctionToolParam {
         name,
-        description: tool.description.clone(),
-        parameters: tool.input_schema.clone(),
+        description: fields.description.clone(),
+        parameters: fields.input_schema.clone(),
         strict: None,
         defer_loading: None,
         extra: std::collections::HashMap::new(),
@@ -149,16 +157,17 @@ fn map_tool(tool: &ToolParam, map: &GatewayToolMap) -> Option<ToolDeclaration> {
 /// the gateway executes: the later versions carry the same settings as the
 /// basic one. A plain function named `web_search` has none.
 pub(crate) fn web_search_config(tool: &ToolParam) -> WebSearchToolParam {
-    if NativeToolVersion::find(NATIVE_WEB_SEARCH_VERSIONS, tool.type_.as_deref()).is_none() {
+    if !matches!(tool, ToolParam::WebSearch(_)) {
         return WebSearchToolParam::default();
     }
 
-    let allowed_domains = tool
+    let fields = tool.fields();
+    let allowed_domains = fields
         .extra
         .get("allowed_domains")
         .cloned()
         .and_then(deserialize_from_value_opt);
-    let blocked_domains = tool
+    let blocked_domains = fields
         .extra
         .get("blocked_domains")
         .cloned()
@@ -167,7 +176,7 @@ pub(crate) fn web_search_config(tool: &ToolParam) -> WebSearchToolParam {
         allowed_domains,
         blocked_domains,
     });
-    let user_location = tool
+    let user_location = fields
         .extra
         .get("user_location")
         .cloned()
@@ -186,7 +195,7 @@ pub(crate) fn web_search_config(tool: &ToolParam) -> WebSearchToolParam {
 /// built, so a failure here is a desynchronized parser: the declaration is
 /// dropped rather than registered with weaker filters, and logged.
 fn web_fetch_config(tool: &ToolParam) -> Option<WebFetchToolParam> {
-    WebFetchToolParam::from_declaration(|field| tool.extra.get(field))
+    WebFetchToolParam::from_declaration(|field| tool.fields().extra.get(field))
         .inspect_err(|error| tracing::error!(error, "web_fetch declaration unreadable after validation"))
         .ok()
 }
@@ -198,7 +207,7 @@ mod tests {
     use super::*;
     use crate::tool::ToolType;
     use crate::types::messages::request::MessagesRequest;
-    use crate::types::messages::tool_seam::NATIVE_WEB_FETCH_VERSIONS;
+    use crate::types::messages::tool_seam::{NATIVE_WEB_FETCH_VERSIONS, NATIVE_WEB_SEARCH_VERSIONS};
     use crate::types::tools::McpDiscoveredToolParam;
 
     fn tools_of(json_req: Value) -> Option<Vec<ToolParam>> {

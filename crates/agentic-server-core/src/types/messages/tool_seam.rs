@@ -27,7 +27,7 @@ pub const WEB_SEARCH_EXECUTOR: &str = "web_search";
 
 /// Claude's basic native web-search server tool version. Every version the
 /// gateway executes is listed in [`NATIVE_WEB_SEARCH_VERSIONS`].
-pub const NATIVE_WEB_SEARCH_TYPE: &str = "web_search_20250305";
+pub use super::tools::NATIVE_WEB_SEARCH_TYPE;
 
 /// The second built-in gateway executor on `/v1/messages`, reachable only
 /// through a native `web_fetch_*` declaration (`tool::web_fetch`).
@@ -35,7 +35,7 @@ pub const WEB_FETCH_EXECUTOR: &str = "web_fetch";
 
 /// Claude's basic native web-fetch server tool version. Every version the
 /// gateway executes is listed in [`NATIVE_WEB_FETCH_VERSIONS`].
-pub const NATIVE_WEB_FETCH_TYPE: &str = "web_fetch_20250910";
+pub use super::tools::NATIVE_WEB_FETCH_TYPE;
 
 /// One version of a native server tool that the Messages gateway executes, and
 /// what it defines beyond its tool's basic version, as Anthropic documents
@@ -213,7 +213,7 @@ pub fn has_gateway_tool(tools: Option<&Vec<ToolParam>>, map: &GatewayToolMap) ->
     tools.is_some_and(|tools| {
         tools
             .iter()
-            .any(|t| map.is_gateway_owned(&t.name) || is_native_web_fetch_type(t.type_.as_deref()))
+            .any(|t| map.is_gateway_owned(t.name()) || is_native_web_fetch_type(t.tool_type()))
     })
 }
 
