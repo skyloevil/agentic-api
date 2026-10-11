@@ -282,6 +282,26 @@ mod tests {
             );
         }
 
+        for version in NATIVE_WEB_SEARCH_VERSIONS {
+            let tools = tools_of(json!({
+                "model": "m", "max_tokens": 10, "messages": [],
+                "tools": [{"type": version.type_name, "name": "web_search", "allowed_callers": ["direct"],
+                           "blocked_domains": ["example.com"]}]
+            }));
+            let mapped = registry_tools(tools.as_ref(), &GatewayToolMap::default());
+            let [ToolDeclaration::WebSearch(param)] = mapped.as_slice() else {
+                panic!("expected WebSearch declaration for {}", version.type_name);
+            };
+            let filters = param.filters.as_ref().expect(version.type_name);
+            assert_eq!(
+                filters.blocked_domains.as_deref(),
+                Some(["example.com".to_owned()].as_slice()),
+                "{}",
+                version.type_name
+            );
+            assert!(filters.allowed_domains.is_none(), "{}", version.type_name);
+        }
+
         // A plain function named web_search has no native settings to read.
         let plain = tools_of(json!({
             "model": "m", "max_tokens": 10, "messages": [],

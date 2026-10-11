@@ -8,17 +8,37 @@ use std::collections::HashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-pub const NATIVE_WEB_SEARCH_TYPE: &str = "web_search_20250305";
-pub const NATIVE_WEB_FETCH_TYPE: &str = "web_fetch_20250910";
+mod versions;
+
+pub use versions::{
+    NATIVE_WEB_FETCH_TYPE, NATIVE_WEB_FETCH_VERSIONS, NATIVE_WEB_SEARCH_TYPE, NATIVE_WEB_SEARCH_VERSIONS,
+    NativeToolVersion,
+};
 
 /// A Messages wire declaration. Add a variant and its discriminator mapping when
 /// supporting a new kind; routing and execution remain the tool layer's decision.
 #[derive(Debug, Clone)]
 pub enum ToolParam {
     Function(MessagesToolFields),
-    WebSearch(MessagesToolFields),
-    WebFetch(MessagesToolFields),
+    WebSearch(MessagesNativeTool),
+    WebFetch(MessagesNativeTool),
     Provider(MessagesProviderTool),
+}
+
+/// A recognized native tool declaration with its original protocol version.
+/// The private version is selected from the shared support table during
+/// deserialization; classification alone does not authorize execution.
+#[derive(Debug, Clone)]
+pub struct MessagesNativeTool {
+    version: NativeToolVersion,
+    pub fields: MessagesToolFields,
+}
+
+impl MessagesNativeTool {
+    #[must_use]
+    pub fn version(&self) -> NativeToolVersion {
+        self.version
+    }
 }
 
 /// Fields shared by the currently supported declarations. JSON Schema and
@@ -50,7 +70,8 @@ impl ToolParam {
     #[must_use]
     pub fn fields(&self) -> &MessagesToolFields {
         match self {
-            Self::Function(fields) | Self::WebSearch(fields) | Self::WebFetch(fields) => fields,
+            Self::Function(fields) => fields,
+            Self::WebSearch(tool) | Self::WebFetch(tool) => &tool.fields,
             Self::Provider(tool) => &tool.fields,
         }
     }
@@ -64,8 +85,7 @@ impl ToolParam {
     pub fn tool_type(&self) -> Option<&str> {
         match self {
             Self::Function(_) => None,
-            Self::WebSearch(_) => Some(NATIVE_WEB_SEARCH_TYPE),
-            Self::WebFetch(_) => Some(NATIVE_WEB_FETCH_TYPE),
+            Self::WebSearch(tool) | Self::WebFetch(tool) => Some(tool.version.type_name),
             Self::Provider(tool) => Some(&tool.tool_type),
         }
     }
@@ -86,11 +106,15 @@ impl<'de> Deserialize<'de> for ToolParam {
         let WireTool { tool_type, fields } = WireTool::deserialize(deserializer)?;
         Ok(match tool_type {
             None => Self::Function(fields),
-            Some(tool_type) => match tool_type.as_str() {
-                NATIVE_WEB_SEARCH_TYPE => Self::WebSearch(fields),
-                NATIVE_WEB_FETCH_TYPE => Self::WebFetch(fields),
-                _ => Self::Provider(MessagesProviderTool { tool_type, fields }),
-            },
+            Some(tool_type) => {
+                if let Some(version) = NativeToolVersion::find(NATIVE_WEB_SEARCH_VERSIONS, Some(&tool_type)) {
+                    Self::WebSearch(MessagesNativeTool { version, fields })
+                } else if let Some(version) = NativeToolVersion::find(NATIVE_WEB_FETCH_VERSIONS, Some(&tool_type)) {
+                    Self::WebFetch(MessagesNativeTool { version, fields })
+                } else {
+                    Self::Provider(MessagesProviderTool { tool_type, fields })
+                }
+            }
         })
     }
 }

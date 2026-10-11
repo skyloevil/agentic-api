@@ -43,10 +43,39 @@ fn supported_discriminators_select_distinct_variants() {
 }
 
 #[test]
+fn every_supported_native_version_is_classified_and_round_trips() {
+    for (versions, name) in [
+        (NATIVE_WEB_SEARCH_VERSIONS, "web_search"),
+        (NATIVE_WEB_FETCH_VERSIONS, "web_fetch"),
+    ] {
+        for version in versions {
+            let value = json!({"type":version.type_name,"name":name,
+                "allowed_callers":["direct"],"allowed_domains":["example.com"],
+                "user_location":{"type":"approximate","city":"Paris"},
+                "future":{"nested":[null,false,42]}});
+            let typed: ToolParam = serde_json::from_value(value.clone()).unwrap();
+            let native = match &typed {
+                ToolParam::WebSearch(native) if name == "web_search" => native,
+                ToolParam::WebFetch(native) if name == "web_fetch" => native,
+                other => panic!("{} classified as {other:?}", version.type_name),
+            };
+            assert_eq!(native.version(), *version);
+            assert_eq!(typed.tool_type(), Some(version.type_name));
+            assert_eq!(serde_json::to_value(typed).unwrap(), value);
+            assert_compatible(&value);
+        }
+    }
+}
+
+#[test]
 fn future_versions_and_provider_fields_round_trip_without_downgrading() {
     for kind in [
         "web_fetch_20990101",
         "web_search_20990101",
+        "web_search_20260210",
+        "web_search_20260318_extra",
+        "web_fetch_20260310",
+        "web_fetch_20260318_extra",
         "bash_20250124",
         "custom",
         "future_tool",
@@ -64,13 +93,12 @@ fn future_versions_and_provider_fields_round_trip_without_downgrading() {
 
 #[test]
 fn wire_acceptance_and_serialization_match_existing_contract() {
-    for kind in [
-        None,
-        Some(NATIVE_WEB_SEARCH_TYPE),
-        Some(NATIVE_WEB_FETCH_TYPE),
-        Some("future"),
-        Some(""),
-    ] {
+    for kind in [None, Some("future"), Some("")].into_iter().chain(
+        NATIVE_WEB_SEARCH_VERSIONS
+            .iter()
+            .chain(NATIVE_WEB_FETCH_VERSIONS)
+            .map(|version| Some(version.type_name)),
+    ) {
         for name in ["echo", "web_search", "web_fetch", "", " "] {
             for schema in [
                 None,
@@ -92,7 +120,11 @@ fn wire_acceptance_and_serialization_match_existing_contract() {
     assert_compatible(&json!({"name":"echo","type":null,"description":null,"input_schema":null}));
     // Native settings remain subject to the existing adapter's validation, not
     // a new deserialization policy that could alter the proxy/loop routing gate.
-    for kind in [NATIVE_WEB_SEARCH_TYPE, NATIVE_WEB_FETCH_TYPE] {
+    for kind in NATIVE_WEB_SEARCH_VERSIONS
+        .iter()
+        .chain(NATIVE_WEB_FETCH_VERSIONS)
+        .map(|version| version.type_name)
+    {
         assert_compatible(&json!({"type":kind,"name":"wrong-name","max_uses":"bad",
             "allowed_domains":false,"user_location":{"type":"future"}}));
     }

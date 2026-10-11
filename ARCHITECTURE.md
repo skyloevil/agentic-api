@@ -453,8 +453,10 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
 - **`types/messages/`** — a separate, parallel type layer for the Anthropic Messages
   API (`MessagesRequest`, `ContentBlock`, etc.). `tools.rs` classifies declarations
   as function tools, supported native web search/fetch tools, or opaque provider
-  tools. Known variants fix their wire discriminator; unknown versions retain
-  their discriminator and extension fields without becoming supported native versions.
+  tools. Supported native variants retain their original version from the shared
+  capability tables in `tools/versions.rs`; classification and request validation use
+  those same tables. Unknown versions retain their discriminator and extension fields
+  without becoming supported native versions.
   New supported kinds extend the enum and its explicit deserialization/serialization
   mapping, then add the corresponding tool-layer conversion and validation.
   `tool_seam.rs` is the pure, I/O-free
