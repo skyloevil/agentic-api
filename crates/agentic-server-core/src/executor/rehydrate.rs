@@ -168,6 +168,7 @@ pub(crate) async fn rehydrate_with_continuation(
     exec_ctx: &ExecutionContext,
     continuation: Option<ResponseContinuation>,
 ) -> ExecutorResult<RequestContext> {
+    request.validate_prompt_cache_options(exec_ctx.responses_config.prompt_cache_options_supported)?;
     validate_multi_agent_request(&request)?;
     // Stored turns never supply `max_tool_calls`, so the request value is final here.
     request.max_tool_calls_limit()?;

@@ -4,12 +4,18 @@ use super::*;
 async fn tier_model(
     status: &'static str,
     tier: Option<&'static str>,
+    cache_options: bool,
 ) -> (Arc<ExecutionContext>, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(
         "/v1/responses",
         post(move |Json(request): Json<Value>| async move {
             assert_eq!(request["service_tier"], "priority");
-            assert_eq!(request["prompt_cache_retention"], "24h");
+            if cache_options {
+                assert_eq!(request["prompt_cache_options"], json!({"mode":"explicit","ttl":"30m"}));
+                assert!(request.get("prompt_cache_retention").is_none());
+            } else {
+                assert_eq!(request["prompt_cache_retention"], "24h");
+            }
             let input = request["input"].as_array().unwrap();
             let child = input.last().unwrap()["content"]
                 .as_str()
@@ -78,6 +84,10 @@ async fn tier_model(
         Arc::new(reqwest::Client::new()),
         format!("http://{address}"),
     );
+    let exec = exec.with_responses_config(crate::config::ResponsesConfig {
+        prompt_cache_options_supported: cache_options,
+        ..crate::config::ResponsesConfig::default()
+    });
     (Arc::new(exec), server)
 }
 
@@ -85,14 +95,22 @@ async fn tier_model(
 async fn final_root_tier_controls_json_sse_and_stored_snapshot() {
     for stream in [false, true] {
         for status in ["completed", "failed", "incomplete"] {
-            for tier in [Some("default"), None] {
-                let (exec, server) = tier_model(status, tier).await;
+            for (tier, cache_options) in [
+                (Some("default"), false),
+                (None, false),
+                (Some("default"), true),
+                (None, true),
+            ] {
+                let (exec, server) = tier_model(status, tier, cache_options).await;
                 let request = RequestPayload {
                     model: "test".into(),
                     store: true,
                     stream,
                     service_tier: Some("priority".into()),
-                    prompt_cache_retention: Some(crate::types::request_response::PromptCacheRetention::TwentyFourHours),
+                    prompt_cache_retention: (!cache_options)
+                        .then_some(crate::types::request_response::PromptCacheRetention::TwentyFourHours),
+                    prompt_cache_options: cache_options
+                        .then(|| serde_json::from_value(json!({"mode":"explicit","ttl":"30m"})).unwrap()),
                     input: ResponsesInput::Text("review context".into()),
                     multi_agent: Some(MultiAgentConfig {
                         enabled: true,

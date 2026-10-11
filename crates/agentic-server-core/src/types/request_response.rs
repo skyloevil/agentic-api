@@ -9,6 +9,8 @@ use super::io::{FunctionTool, InputItem, MultiAgentConfig, OutputItem, ResponseU
 use super::tools::ResponsesTool;
 use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolDeclaration, ToolError, responses_declarations};
 
+mod prompt_cache;
+pub use prompt_cache::{PromptCacheMode, PromptCacheOptions, PromptCacheOptionsError, PromptCacheTtl};
 mod max_tool_calls;
 mod response_stream;
 mod serde_helpers;
@@ -137,6 +139,8 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<String>,
@@ -185,6 +189,8 @@ pub struct UpstreamRequest<'a> {
     pub prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<&'a PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,6 +282,7 @@ impl<T: ?Sized> RequestPayload<T> {
             parallel_tool_calls: self.parallel_tool_calls,
             prompt_cache_key: self.prompt_cache_key,
             prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options,
             service_tier: self.service_tier,
             multi_agent: self.multi_agent,
             cache_salt: self.cache_salt,
@@ -356,6 +363,7 @@ impl RequestPayload {
             parallel_tool_calls,
             prompt_cache_key: self.prompt_cache_key.as_deref(),
             prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options.as_ref(),
             service_tier: self.service_tier.as_deref(),
             cache_salt: self.cache_salt.as_deref(),
         })
@@ -387,6 +395,8 @@ pub struct CompactRequest {
     pub service_tier: Option<String>,
     #[serde(default)]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
     /// Compatibility fields sent by current SDK and Codex clients.

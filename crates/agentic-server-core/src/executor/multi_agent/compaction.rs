@@ -5,7 +5,7 @@ use crate::executor::pending_calls::resolved_prefix_len;
 use crate::executor::request::ExecutionContext;
 use crate::types::agent::AgentIdentity;
 use crate::types::io::{InputItem, ResponseUsage, ResponsesInput};
-use crate::types::request_response::{PromptCacheRetention, RequestPayload};
+use crate::types::request_response::{PromptCacheOptions, PromptCacheRetention, RequestPayload};
 
 pub struct CompactionPlan {
     agent: AgentIdentity,
@@ -15,6 +15,7 @@ pub struct CompactionPlan {
     instructions: Option<String>,
     prompt_cache_key: Option<String>,
     prompt_cache_retention: Option<PromptCacheRetention>,
+    prompt_cache_options: Option<PromptCacheOptions>,
     service_tier: Option<String>,
 }
 
@@ -75,6 +76,7 @@ impl CompactionPlan {
             instructions: request.instructions.clone(),
             prompt_cache_key: request.prompt_cache_key.clone(),
             prompt_cache_retention: request.prompt_cache_retention,
+            prompt_cache_options: request.prompt_cache_options,
             service_tier: request.service_tier.clone(),
         }))
     }
@@ -96,6 +98,7 @@ impl CompactionPlan {
             instructions: self.instructions,
             prompt_cache_key: self.prompt_cache_key,
             prompt_cache_retention: self.prompt_cache_retention,
+            prompt_cache_options: self.prompt_cache_options,
             service_tier: self.service_tier,
             ..Default::default()
         };

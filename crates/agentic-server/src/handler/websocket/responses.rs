@@ -234,6 +234,14 @@ async fn handle_ws_request(request: WsRequest, context: RequestExecution<'_>) ->
     } = request;
     let mut execution = execution.unwrap_or_else(telemetry::QueuedExecution::new).dispatch();
 
+    if let Err(error) =
+        payload.validate_prompt_cache_options(state.exec_ctx.responses_config.prompt_cache_options_supported)
+    {
+        let result = Err(WsError::from(agentic_core::executor::ExecutorError::from(error)));
+        telemetry::finish_local(&mut execution, &result);
+        return result;
+    }
+
     if generate == Some(false) {
         debug!("handling non-generating websocket request locally");
         let result = complete_without_inference(outbound_tx, state, payload, stream_id.as_ref(), session, event_limit)

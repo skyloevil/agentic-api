@@ -73,6 +73,12 @@ pub async fn responses(State(state): State<AppState>, req: Request) -> Response 
         Err(error) => return executor_error_response(error.into()),
     };
 
+    if let Err(error) =
+        routing_payload.validate_prompt_cache_options(state.exec_ctx.responses_config.prompt_cache_options_supported)
+    {
+        return executor_error_response(error.into());
+    }
+
     let has_tool_search_state = ToolSearchHandler::request_has_state(&routing_payload);
     let should_execute = routing_payload.store
         || routing_payload.previous_response_id.is_some()

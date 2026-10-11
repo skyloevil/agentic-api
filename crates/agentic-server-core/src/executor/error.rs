@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::StorageError;
 use crate::tool::ToolError;
-use crate::types::request_response::{MAX_TOOL_CALLS_PARAM, MaxToolCallsError};
+use crate::types::request_response::{MAX_TOOL_CALLS_PARAM, MaxToolCallsError, PromptCacheOptionsError};
 use crate::utils::common::serialize_to_vec_or_default;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +112,9 @@ pub enum ExecutorError {
     #[error(transparent)]
     InvalidMaxToolCalls(#[from] MaxToolCallsError),
 
+    #[error(transparent)]
+    InvalidPromptCacheOptions(#[from] PromptCacheOptionsError),
+
     /// The request exceeds a documented transport or component size budget.
     #[error("{0}")]
     PayloadTooLarge(String),
@@ -164,6 +167,7 @@ impl ExecutorError {
             Self::ConversationLocked { .. }
             | Self::Tool(ToolError::Config(_) | ToolError::MissingOutput { .. })
             | Self::InvalidRequest(_)
+            | Self::InvalidPromptCacheOptions(_)
             | Self::InvalidMaxToolCalls(_)
             | Self::PreviousResponseNotFound { .. }
             | Self::JsonError(_) => StatusCode::BAD_REQUEST,
@@ -191,6 +195,7 @@ impl ExecutorError {
             Self::ConversationLocked { .. }
             | Self::Tool(ToolError::Config(_) | ToolError::MissingOutput { .. })
             | Self::InvalidRequest(_)
+            | Self::InvalidPromptCacheOptions(_)
             | Self::InvalidMaxToolCalls(_)
             | Self::PreviousResponseNotFound { .. }
             | Self::ParseError(_)
@@ -225,6 +230,10 @@ impl ExecutorError {
             Self::Storage(StorageError::ItemAlreadyInConversation) => "item_already_in_conversation",
             Self::PayloadTooLarge(_) => "body_too_large",
             Self::ResourceLimitExceeded { .. } => "response_resource_limit_exceeded",
+            Self::InvalidPromptCacheOptions(error) => match error {
+                PromptCacheOptionsError::Unsupported => "unsupported_parameter",
+                PromptCacheOptionsError::ConflictingRetention => "invalid_value",
+            },
             Self::InvalidMaxToolCalls(error) => error.code(),
             other => other.error_type(),
         }
@@ -240,6 +249,7 @@ impl ExecutorError {
             Self::ConversationLocked { .. } => Some("conversation"),
             Self::PreviousResponseNotFound { .. } => Some("previous_response_id"),
             Self::Tool(ToolError::MissingOutput { .. }) => Some("input"),
+            Self::InvalidPromptCacheOptions(_) => Some("prompt_cache_options"),
             Self::InvalidMaxToolCalls(_) => Some(MAX_TOOL_CALLS_PARAM),
             _ => None,
         }
