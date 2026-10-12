@@ -64,7 +64,7 @@ async fn json_parity_and_durable_continuation_preserve_request_scoped_options() 
     }
     let requests = captured.lock().await;
     assert_eq!(requests.len(), 13);
-    for (pair, options) in requests[..8].chunks_exact(2).zip([
+    for (pair, options) in requests[..8].as_chunks::<2>().0.iter().zip([
         json!({}),
         json!({"mode":"implicit"}),
         json!({"ttl":"30m"}),

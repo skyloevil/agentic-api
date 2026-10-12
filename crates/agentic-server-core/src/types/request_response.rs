@@ -14,11 +14,13 @@ pub use prompt_cache::{PromptCacheMode, PromptCacheOptions, PromptCacheOptionsEr
 mod max_tool_calls;
 mod response_stream;
 mod serde_helpers;
+mod standard_response;
 pub use max_tool_calls::{JsonKind, MAX_TOOL_CALLS_PARAM, MaxToolCalls, MaxToolCallsError, OutOfRangeInteger};
 use serde_helpers::{
     default_true, deserialize_conversation, is_absent_or_default_tool_choice, serialize_conversation_object,
     serialize_upstream_tool_choice,
 };
+pub use standard_response::{ResponseReasoning, StandardResponseFields};
 #[cfg(feature = "openapi")]
 mod schema;
 
@@ -448,12 +450,14 @@ pub struct ResponsePayload {
     /// The request's `max_tool_calls`, always echoed (`null` when unset). Never inherited.
     #[serde(default)]
     pub max_tool_calls: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_service_tier")]
     pub service_tier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_tools")]
     pub tools: Option<Vec<ResponsesTool>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "standard_response::serialize_response_tool_choice")]
     pub tool_choice: Option<ToolChoice>,
+    #[serde(flatten)]
+    pub standard_fields: StandardResponseFields,
 }
 
 #[cfg(test)]
@@ -648,6 +652,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
             max_tool_calls: None,
         };
 
@@ -675,6 +680,7 @@ mod tests {
             tools: None,
             max_tool_calls: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let json = serde_json::to_value(&payload).expect("response should serialize");
@@ -1425,6 +1431,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         for (status, expected_type) in [
@@ -1464,6 +1471,7 @@ mod tests {
             service_tier: None,
             tools: Some(vec![tool]),
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let response = serde_json::to_value(&payload).expect("blocking response");
@@ -1494,6 +1502,7 @@ mod tests {
             service_tier: None,
             tools: None,
             tool_choice: None,
+            standard_fields: StandardResponseFields::default(),
         };
 
         let chunk = payload.as_created_response_chunk();
