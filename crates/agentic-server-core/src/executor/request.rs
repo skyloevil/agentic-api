@@ -7,6 +7,7 @@ use crate::error::Error;
 use crate::executor::gateway::GatewaySchedulerPolicy;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::multi_agent::ValidatedTreeCheckpoint;
+use crate::executor::telemetry::ExecutorMetrics;
 use crate::storage::backend::redact_database_urls;
 use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
@@ -63,6 +64,8 @@ impl RequestContext {
             .previous_response_id
             .clone_from(&self.original_request.previous_response_id);
         payload.max_tool_calls = self.max_tool_calls().map(NonZeroU64::get);
+        payload.standard_fields.apply_request(&self.original_request);
+        payload.standard_fields.completed_at = (payload.status == "completed").then(crate::utils::common::utcnow_str);
     }
 }
 
@@ -90,6 +93,9 @@ pub struct ExecutionContext {
     /// Bounded-concurrency policy applied to gateway-owned calls in each round.
     pub(crate) gateway_scheduler_policy: GatewaySchedulerPolicy,
     pub responses_config: ResponsesConfig,
+    /// Execution, stage, token, and timing instruments. Defaults to the
+    /// globally registered meter provider at construction time.
+    pub metrics: ExecutorMetrics,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
 }
 
@@ -124,8 +130,17 @@ impl ExecutionContext {
             streaming_timeout: streaming_timeout_from_env(),
             gateway_scheduler_policy: GatewaySchedulerPolicy::default(),
             responses_config: ResponsesConfig::default(),
+            metrics: ExecutorMetrics::from_global(),
             storage_pool: None,
         }
+    }
+
+    /// Record executor metrics with instruments from the embedding
+    /// application's meter instead of the global provider.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: ExecutorMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     #[must_use]
@@ -202,6 +217,7 @@ impl ExecutionContext {
             streaming_timeout: streaming_timeout_from_env(),
             gateway_scheduler_policy: GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
             responses_config: cfg.responses,
+            metrics: ExecutorMetrics::from_global(),
             storage_pool: Some(pool),
         })
     }

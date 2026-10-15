@@ -32,6 +32,10 @@ use crate::executor::{
     relay::{AgentFrame, AgentRoundId},
     request::ExecutionContext,
     response_budget::ExecutorResponseBudget,
+    telemetry::{
+        Api,
+        metrics::{ExecutionClock, RoundCounter},
+    },
 };
 use crate::tool::ToolSearchState;
 use crate::types::{
@@ -89,6 +93,10 @@ pub(super) struct MultiAgentRun {
     sealer: TranscriptSealer,
     payload: ResponsePayload,
     rounds: usize,
+    /// Every agent's upstream rounds, recorded once for the execution.
+    round_counter: RoundCounter,
+    /// The execution's timing state, shared with each round's pipeline.
+    clock: Option<ExecutionClock>,
     max_retained_bytes: usize,
     frame_sender: mpsc::Sender<AgentFrame>,
     frames: mpsc::Receiver<AgentFrame>,
@@ -148,6 +156,11 @@ impl MultiAgentRun {
             service_tier: None,
             tools: pipeline.request.enriched_request.tools.clone(),
             tool_choice: pipeline.request.enriched_request.tool_choice.clone(),
+            standard_fields: {
+                let mut fields = crate::types::request_response::StandardResponseFields::default();
+                fields.apply_request(&pipeline.request.original_request);
+                fields
+            },
         };
         // One bounded event in flight, plus one size-limited awaited frame per
         // active worker. Client backpressure reaches upstream readers.
@@ -168,6 +181,8 @@ impl MultiAgentRun {
             sealer: TranscriptSealer::new()?,
             payload,
             rounds: 0,
+            round_counter: exec.metrics.rounds(Api::Responses),
+            clock: pipeline.execution_clock().cloned(),
             max_retained_bytes: exec.responses_config.max_retained_bytes,
         })
     }
@@ -217,6 +232,7 @@ impl MultiAgentRun {
             &CheckpointLimits::for_response(self.max_retained_bytes),
         )?);
         self.payload.output = self.completed_items.into_values().collect();
+        self.payload.standard_fields.completed_at = (self.payload.status == "completed").then(utcnow_str);
         Ok(self.payload)
     }
 

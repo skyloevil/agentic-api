@@ -11,7 +11,7 @@
 *Run OpenAI-grade agentic workloads (Responses and Messages APIs, server-side tools, Codex, Claude Code) on your own GPUs.*
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?logo=rust)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/Rust-1.98.1%2B-orange.svg?logo=rust)](Cargo.toml)
 [![CI](https://github.com/vllm-project/agentic-api/actions/workflows/rust.yml/badge.svg)](https://github.com/vllm-project/agentic-api/actions/workflows/rust.yml)
 [![pre-commit](https://github.com/vllm-project/agentic-api/actions/workflows/pre-commit.yml/badge.svg)](https://github.com/vllm-project/agentic-api/actions/workflows/pre-commit.yml)
 
@@ -273,7 +273,7 @@ llm_api_base = "http://127.0.0.1:5050"
 [web_search]
 # Search backend for the gateway-owned web_search tool: "you" (default), "brave", "tavily", or "searxng".
 provider = "you"
-base_url = "https://api.ydc-index.io"
+base_url = "https://ydc-index.io"
 api_key_env = "YOU_API_KEY"
 # Concurrent provider requests inside one batched web-search call; unset uses
 # the provider default (Brave: 1; You.com, Tavily and SearXNG: max_concurrent_gateway_calls).

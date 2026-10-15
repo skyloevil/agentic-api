@@ -11,7 +11,7 @@ use crate::executor::{
     relay::{RelayLimits, StreamRelay},
     request::{ExecutionContext, RequestContext},
     response_events::{ResponseCommitState, ResponseEventSink},
-    telemetry::ExecutionSpan,
+    telemetry::{ExecutionSpan, InstrumentedStream},
 };
 use crate::tool::ToolSearchState;
 use std::{num::NonZeroUsize, sync::Arc};
@@ -90,6 +90,8 @@ pub(super) fn start(
     let sink = ResponseEventSink::new(sender, max_bytes);
     let relay = StreamRelay::response(sink.clone(), RelayLimits::with_event_bytes(max_bytes));
     let mut pipeline = AgentPipeline::new(ctx, tools, relay);
+    let clock = execution.clock().clone();
+    pipeline.set_execution_clock(clock.clone());
     let control = if pipeline
         .request
         .enriched_request
@@ -114,7 +116,7 @@ pub(super) fn start(
         let result = Box::pin(async {
             // The multi-agent coordinator handles cancellation by joining its children.
             let multi = pipeline.request.enriched_request.multi_agent.as_ref().is_some_and(|config| config.enabled);
-            let run = run_until_gateway_tools_complete(&mut pipeline, &exec, auth.as_deref(), true);
+            let run = Box::pin(run_until_gateway_tools_complete(&mut pipeline, &exec, auth.as_deref(), true));
             let (payload, metadata) = if multi { run.await? } else {
                 tokio::select! {
                     result = run => result?,
@@ -128,7 +130,7 @@ pub(super) fn start(
             tokio::select! {
                 biased;
                 () = worker_cancel.cancelled() => return Err(ExecutorError::StreamError("response cancelled before commit".into())),
-                result = persist_if_needed(payload, ctx, metadata, exec.conv_handler.clone(), exec.resp_handler.clone()) => result?,
+                result = persist_if_needed(payload, ctx, metadata, exec.conv_handler.clone(), exec.resp_handler.clone(), &exec.metrics) => result?,
             }
             tokio::select! {
                 () = worker_cancel.cancelled() => return Err(ExecutorError::StreamError("response delivery cancelled".into())),
@@ -168,7 +170,10 @@ pub(super) fn start(
         }
         result
     }.instrument(span));
-    let events = ResponseEventSink::stream(receiver);
+    let events = Box::pin(InstrumentedStream::timing_delivery(
+        ResponseEventSink::stream(receiver, Some(clock.clone())),
+        clock,
+    ));
     let owner_sink = sink.clone();
     RunningResponse {
         response_id,

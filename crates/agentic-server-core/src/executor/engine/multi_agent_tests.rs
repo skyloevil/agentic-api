@@ -6,6 +6,8 @@ mod client_tools;
 mod explicit_compaction;
 #[path = "multi_agent_tests/live_control.rs"]
 mod live_control;
+#[path = "multi_agent_tests/metrics.rs"]
+mod metrics;
 #[path = "multi_agent_tests/root_completion.rs"]
 mod root_completion;
 #[path = "multi_agent_tests/service_tier.rs"]
@@ -54,6 +56,10 @@ fn function(call_id: &str, name: &str, arguments: Value) -> Value {
 fn message(text: &str) -> Value {
     json!({"type":"message","id":uuid7_str("msg_"),"role":"assistant","status":"completed",
         "content":[{"type":"output_text","text":text,"annotations":[]}]})
+}
+
+fn has_message_text(item: &Value, text: &str) -> bool {
+    item["content"] == text || item["content"][0]["text"] == text
 }
 
 // Check the actual upstream request on initial execution and stored continuation.
@@ -160,7 +166,7 @@ async fn setup_with_compaction_gate(
                 output
             } else if let Some(output) = shell_review_output(&request) {
                 output
-            } else if input.iter().any(|item| item["content"] == "simple compaction test") {
+            } else if input.iter().any(|item| has_message_text(item, "simple compaction test")) {
                 vec![message("finished")]
             } else if let Some(child) = child {
                 let call_id = format!("proposal_{child}");

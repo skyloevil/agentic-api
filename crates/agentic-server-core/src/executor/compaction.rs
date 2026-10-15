@@ -4,6 +4,8 @@ pub(crate) use estimate::{estimate_history_tokens, estimate_input_tokens};
 mod context;
 mod summary;
 
+use super::telemetry::FailureCategory;
+use super::telemetry::metrics::Stage;
 use super::telemetry::stages::CompactionTrigger;
 use context::item_has_meaningful_context;
 use summary::completed_summary_text;
@@ -19,8 +21,10 @@ use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::upstream::fetch_blocking_payload;
 use crate::tool::ToolSearchState;
 use crate::types::event::MessageStatus;
-use crate::types::io::input::latest_compaction_window;
-use crate::types::io::{CompactionItem, InputItem, InputMessage, InputMessageContent, ResponseUsage, ResponsesInput};
+use crate::types::io::input::{InputTextContent, latest_compaction_window};
+use crate::types::io::{
+    CompactionItem, InputContent, InputItem, InputMessage, InputMessageContent, ResponseUsage, ResponsesInput,
+};
 use crate::types::request_response::{CompactRequest, CompactedResponse, RequestPayload};
 use crate::utils::common::{utcnow_str, uuid7_str};
 
@@ -42,6 +46,10 @@ fn retained_user_window(items: &[InputItem]) -> Vec<InputItem> {
             let mut retained = message.clone();
             retained.id = Some(uuid7_str("msg_"));
             retained.status = Some(MessageStatus::Completed);
+            if let InputMessageContent::Text(text) = &retained.content {
+                retained.content =
+                    InputMessageContent::Parts(vec![InputContent::InputText(InputTextContent::new(text.clone()))]);
+            }
             Some(InputItem::Message(retained))
         })
         .collect()
@@ -117,6 +125,18 @@ async fn compact_items_with_trigger(
     auth: Option<&str>,
     trigger: CompactionTrigger,
 ) -> ExecutorResult<(Vec<InputItem>, ResponseUsage, Option<String>)> {
+    let timer = exec_ctx.metrics.stage(Stage::Compaction);
+    let summarized = summarize_items(request, input, exec_ctx, auth).await;
+    timer.finish_result(&summarized);
+    summarized
+}
+
+async fn summarize_items(
+    request: &RequestPayload,
+    input: ResponsesInput,
+    exec_ctx: &ExecutionContext,
+    auth: Option<&str>,
+) -> ExecutorResult<(Vec<InputItem>, ResponseUsage, Option<String>)> {
     let original_items = Vec::from(input);
     if !original_items.iter().any(item_has_meaningful_context) {
         return Err(ExecutorError::InvalidRequest(
@@ -161,6 +181,7 @@ async fn compact_items_with_trigger(
     let mut agent = AgentPipeline::new(ctx, None, StreamRelay::detached());
     let response =
         fetch_blocking_payload(&mut agent, exec_ctx, auth, &crate::tool::ToolRegistry::default(), None).await?;
+    exec_ctx.metrics.record_response_usage(response.usage.as_ref());
     let summary = completed_summary_text(&response)?;
 
     Ok((
@@ -287,6 +308,7 @@ pub async fn compact_response(
 
     let response_id = ctx.response_id.clone();
     ctx.new_input_items.clone_from(&output);
+    let timer = exec_ctx.metrics.stage(Stage::Persist);
     match persist_prepared_turn(
         ctx,
         tool_search_metadata,
@@ -297,8 +319,13 @@ pub async fn compact_response(
     )
     .await
     {
-        Ok(()) | Err(ExecutorError::Storage(crate::StorageError::NotConfigured)) => {}
-        Err(error) => return Err(error),
+        Ok(()) => timer.finish(None),
+        // Without storage nothing was written, so there is no stage to time.
+        Err(ExecutorError::Storage(crate::StorageError::NotConfigured)) => timer.discard(),
+        Err(error) => {
+            timer.finish(Some(FailureCategory::from(&error)));
+            return Err(error);
+        }
     }
 
     Ok(CompactedResponse {
@@ -1145,7 +1172,7 @@ mod tests {
         let serialized = serde_json::to_value(model_input.model_input()).expect("model input serializes");
 
         assert_eq!(serialized.as_array().map(Vec::len), Some(2));
-        assert_eq!(serialized[0]["content"], "remember banana");
+        assert_eq!(serialized[0]["content"][0]["text"], "remember banana");
         assert_eq!(serialized[1]["role"], "assistant");
         assert_eq!(serialized[1]["content"][0]["text"], "durable summary");
         server.abort();
