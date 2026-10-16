@@ -16,7 +16,8 @@ pub const MAX_STREAM_EVENT_BYTES_ENV: &str = "AGENTIC_MAX_STREAM_EVENT_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsesConfig {
-    /// Operator assertion that every served model accepts the mode/TTL contract.
+    /// Operator assertion that typed execution supports the mode/TTL contract for every served model.
+    /// Direct HTTP pass-through does not consult this switch.
     pub prompt_cache_options_supported: bool,
     pub max_retained_bytes: usize,
     pub max_upstream_json_bytes: usize,

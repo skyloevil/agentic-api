@@ -12,7 +12,7 @@ async fn tier_model(
             assert_eq!(request["service_tier"], "priority");
             if cache_options {
                 assert_eq!(request["prompt_cache_options"], json!({"mode":"explicit","ttl":"30m"}));
-                assert!(request.get("prompt_cache_retention").is_none());
+                assert_eq!(request["prompt_cache_retention"], "24h");
             } else {
                 assert_eq!(request["prompt_cache_retention"], "24h");
             }
@@ -110,8 +110,7 @@ async fn final_root_tier_controls_json_sse_and_stored_snapshot() {
                     temperature: Some(0.4),
                     metadata: Some(json!({"review": "multi-agent"})),
                     service_tier: Some("priority".into()),
-                    prompt_cache_retention: (!cache_options)
-                        .then_some(crate::types::request_response::PromptCacheRetention::TwentyFourHours),
+                    prompt_cache_retention: Some(crate::types::request_response::PromptCacheRetention::TwentyFourHours),
                     prompt_cache_options: cache_options
                         .then(|| serde_json::from_value(json!({"mode":"explicit","ttl":"30m"})).unwrap()),
                     input: ResponsesInput::Text("review context".into()),
@@ -156,6 +155,9 @@ async fn final_root_tier_controls_json_sse_and_stored_snapshot() {
                     "{status}, stream={stream}"
                 );
                 assert_eq!(payload.status, if status == "failed" { "error" } else { status });
+                let expected_options =
+                    cache_options.then(|| serde_json::from_value(json!({"mode":"explicit","ttl":"30m"})).unwrap());
+                assert_eq!(payload.standard_fields.prompt_cache_options, expected_options);
                 assert!(payload.standard_fields.store);
                 assert!(payload.standard_fields.parallel_tool_calls);
                 assert!((payload.standard_fields.temperature - 0.4).abs() < f64::EPSILON);
@@ -168,6 +170,7 @@ async fn final_root_tier_controls_json_sse_and_stored_snapshot() {
                     ));
                 } else {
                     let stored = exec.resp_handler.retrieve(&payload.id).await.unwrap();
+                    assert_eq!(stored.standard_fields.prompt_cache_options, expected_options);
                     assert_eq!(stored.service_tier.as_deref(), tier.or(Some("default")));
                 }
                 server.abort();

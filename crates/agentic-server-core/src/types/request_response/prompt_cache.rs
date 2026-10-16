@@ -23,7 +23,8 @@ pub enum PromptCacheTtl {
 
 /// Request-scoped prompt-cache options. The gateway never inserts upstream defaults.
 ///
-/// Prewarming, diagnostics, and future fields are deliberately rejected until qualified.
+/// Typed execution rejects prewarming, diagnostics, and future fields until qualified.
+/// Direct HTTP pass-through leaves their interpretation to the upstream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -76,21 +77,16 @@ pub enum PromptCacheOptionsError {
         "prompt_cache_options is not enabled for this upstream; configure responses.prompt_cache_options_supported only after verifying the mode/TTL contract for every served model"
     )]
     Unsupported,
-    #[error("prompt_cache_options and prompt_cache_retention cannot be combined; select one cache policy")]
-    ConflictingRetention,
 }
 
 impl<T: ?Sized> RequestPayload<T> {
-    /// Validate deployment support and this gateway's mutually exclusive policy forms.
+    /// Validate deployment support for typed execution.
     ///
     /// # Errors
-    /// Rejects unqualified upstreams and simultaneous legacy retention settings.
+    /// Rejects typed execution against unqualified upstreams. Legacy retention remains independent.
     pub fn validate_prompt_cache_options(&self, supported: bool) -> Result<(), PromptCacheOptionsError> {
         if self.prompt_cache_options.is_none() {
             return Ok(());
-        }
-        if self.prompt_cache_retention.is_some() {
-            return Err(PromptCacheOptionsError::ConflictingRetention);
         }
         if !supported {
             return Err(PromptCacheOptionsError::Unsupported);
@@ -143,10 +139,26 @@ mod tests {
                 Err(PromptCacheOptionsError::Unsupported)
             );
             request.prompt_cache_retention = Some(super::super::PromptCacheRetention::TwentyFourHours);
+            assert_eq!(request.validate_prompt_cache_options(true), Ok(()));
+        }
+    }
+
+    #[test]
+    fn routing_preserves_raw_options_but_execution_requires_the_typed_contract() {
+        use serde_json::value::RawValue;
+        for value in [json!({"prewarm":true}), json!({"future":1}), json!([])] {
+            let wire = json!({"model":"test","input":"hi","prompt_cache_options":value});
+            let routing: RequestPayload<RawValue, Box<RawValue>> = serde_json::from_value(wire).unwrap();
             assert_eq!(
-                request.validate_prompt_cache_options(true),
-                Err(PromptCacheOptionsError::ConflictingRetention)
+                serde_json::from_str::<serde_json::Value>(routing.prompt_cache_options.as_ref().unwrap().get())
+                    .unwrap(),
+                value
             );
+            let typed = routing.try_map_configs(
+                |text| serde_json::from_str::<ResponseTextConfig>(text.get()).map(Box::new),
+                |options| serde_json::from_str::<PromptCacheOptions>(options.get()),
+            );
+            assert!(typed.is_err());
         }
     }
 

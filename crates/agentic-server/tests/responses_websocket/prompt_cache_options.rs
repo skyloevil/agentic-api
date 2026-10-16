@@ -28,19 +28,28 @@ async fn options_are_request_scoped_on_transient_websocket_continuations() {
     .into_iter()
     .enumerate()
     {
-        let mut request = json!({"type":"response.create","model":"test-model","input":"hi","store":false});
+        let mut request = json!({"type":"response.create","model":"test-model","input":"hi","store":false,"prompt_cache_retention":"24h"});
         if i > 0 {
             request["previous_response_id"] = parent;
         }
+        let expected = options.clone().unwrap_or(Value::Null);
         if let Some(options) = options {
             request["prompt_cache_options"] = options;
         }
         send_json(&mut ws, request).await;
         let events = recv_until_completed(&mut ws).await;
+        for response in events.iter().filter_map(|event| event.get("response")) {
+            assert_eq!(response.get("prompt_cache_options"), Some(&expected));
+        }
         parent = events.last().unwrap()["response"]["id"].clone();
     }
     let requests = mock.request_bodies().await;
     assert_eq!(requests.len(), 4);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["prompt_cache_retention"] == "24h")
+    );
     assert_eq!(
         requests[0]["prompt_cache_options"],
         json!({"mode":"explicit","ttl":"30m"})
@@ -76,7 +85,7 @@ async fn unsupported_options_reject_generating_and_local_completion_before_histo
 }
 
 #[tokio::test]
-async fn invalid_and_conflicting_options_reject_before_websocket_inference() {
+async fn invalid_options_reject_before_websocket_inference() {
     let mock = MockResponsesServer::start(vec![]).await;
     let fixture = storage_backed_state_with_responses_config(
         &mock.url,
@@ -106,15 +115,34 @@ async fn invalid_and_conflicting_options_reject_before_websocket_inference() {
         assert_eq!(error["type"], "error");
         assert_eq!(error["error"]["type"], "invalid_request_error");
     }
+    assert!(mock.request_bodies().await.is_empty());
+    gateway.abort();
+}
+
+#[tokio::test]
+async fn local_completion_echoes_options_without_inference() {
+    let mock = MockResponsesServer::start(vec![]).await;
+    let fixture = storage_backed_state_with_responses_config(
+        &mock.url,
+        ResponsesConfig {
+            prompt_cache_options_supported: true,
+            ..ResponsesConfig::default()
+        },
+    )
+    .await;
+    let (url, gateway) = spawn_gateway(fixture.state.clone()).await;
+    let mut ws = connect_responses_ws(&url).await;
+    let options = json!({"mode":"explicit","ttl":"30m"});
     send_json(
         &mut ws,
         json!({"type":"response.create","model":"test-model","input":"hi",
-        "prompt_cache_options":{"mode":"explicit"},"prompt_cache_retention":"24h"}),
+        "store":false,"generate":false,"prompt_cache_options":options,"prompt_cache_retention":"24h"}),
     )
     .await;
-    let error = recv_json(&mut ws).await;
-    assert_eq!(error["error"]["param"], "prompt_cache_options");
-    assert_eq!(error["error"]["code"], "invalid_value");
+    let events = recv_until_completed(&mut ws).await;
+    for response in events.iter().filter_map(|event| event.get("response")) {
+        assert_eq!(response.get("prompt_cache_options"), Some(&options));
+    }
     assert!(mock.request_bodies().await.is_empty());
     gateway.abort();
 }

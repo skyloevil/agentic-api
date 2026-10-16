@@ -230,10 +230,7 @@ impl ExecutorError {
             Self::Storage(StorageError::ItemAlreadyInConversation) => "item_already_in_conversation",
             Self::PayloadTooLarge(_) => "body_too_large",
             Self::ResourceLimitExceeded { .. } => "response_resource_limit_exceeded",
-            Self::InvalidPromptCacheOptions(error) => match error {
-                PromptCacheOptionsError::Unsupported => "unsupported_parameter",
-                PromptCacheOptionsError::ConflictingRetention => "invalid_value",
-            },
+            Self::InvalidPromptCacheOptions(PromptCacheOptionsError::Unsupported) => "unsupported_parameter",
             Self::InvalidMaxToolCalls(error) => error.code(),
             other => other.error_type(),
         }

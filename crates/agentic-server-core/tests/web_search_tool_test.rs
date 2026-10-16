@@ -1219,7 +1219,7 @@ async fn prompt_cache_options_survive_every_gateway_tool_round() {
         let options = serde_json::json!({"mode":"explicit","ttl":"30m"});
         let request: RequestPayload = serde_json::from_value(serde_json::json!({
             "model":"test-model", "input":"look up rust async", "store":true, "stream":stream,
-            "tools":[{"type":"web_search_preview"}], "prompt_cache_options":options
+            "tools":[{"type":"web_search_preview"}], "prompt_cache_options":options, "prompt_cache_retention":"24h"
         }))
         .unwrap();
         match ExecuteRequest::new(request, exec).run().await.unwrap() {
@@ -1235,7 +1235,7 @@ async fn prompt_cache_options_survive_every_gateway_tool_round() {
         assert_eq!(requests.len(), 2);
         for request in &requests {
             assert_eq!(request["prompt_cache_options"], options);
-            assert!(request.get("prompt_cache_retention").is_none());
+            assert_eq!(request["prompt_cache_retention"], "24h");
         }
         assert!(
             requests[1]["input"]

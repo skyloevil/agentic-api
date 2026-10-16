@@ -161,7 +161,7 @@ async fn compact_endpoint_preserves_request_scoped_prompt_cache_options() {
         .await
         .unwrap();
     for option in [None, Some(serde_json::Value::Null), Some(options.clone())] {
-        let mut request = serde_json::json!({"model":"test-model","previous_response_id":parent["id"]});
+        let mut request = serde_json::json!({"model":"test-model","previous_response_id":parent["id"],"prompt_cache_retention":"24h"});
         if let Some(option) = option {
             request["prompt_cache_options"] = option;
         }
@@ -192,6 +192,7 @@ async fn compact_endpoint_preserves_request_scoped_prompt_cache_options() {
     assert!(requests[2].get("prompt_cache_options").is_none());
     assert_eq!(requests[3]["prompt_cache_options"], options);
     for request in &requests[1..] {
+        assert_eq!(request["prompt_cache_retention"], "24h");
         assert_eq!(request["input"][0]["content"], "parent context");
     }
     gateway.abort();

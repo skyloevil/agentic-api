@@ -117,7 +117,7 @@ async fn sse_parity_preserves_explicit_mode_and_existing_content_breakpoint() {
 }
 
 #[tokio::test]
-async fn invalid_conflicting_and_unqualified_options_fail_before_upstream_or_storage() {
+async fn invalid_and_unqualified_typed_options_fail_before_upstream_or_storage() {
     let (url, captured, model) = spawn_mock_vllm_json_capture().await;
     for supported in [false, true] {
         let mut fixture = storage_backed_state(&url).await;
@@ -125,46 +125,41 @@ async fn invalid_conflicting_and_unqualified_options_fail_before_upstream_or_sto
             enable_options(&mut fixture);
         }
         let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
-        for store in [false, true] {
-            for options in [
-                json!({"mode":"auto"}),
-                json!({"mode":null}),
-                json!({"ttl":"24h"}),
-                json!({"ttl":null}),
-                json!({"prewarm":true}),
-                json!({"comparison_response_id":"resp_1"}),
-                json!([]),
-            ] {
-                let response = reqwest::Client::new()
-                    .post(format!("{gateway_url}/v1/responses"))
-                    .json(&json!({"model":"test","input":"hi","store":store,"prompt_cache_options":options}))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            }
-            let mut request = json!({"model":"test","input":"hi","store":store,
-                "prompt_cache_options":{"mode":"explicit"}});
-            if supported {
-                request["prompt_cache_retention"] = json!("24h");
-            }
+        for options in [
+            json!({"mode":"auto"}),
+            json!({"mode":null}),
+            json!({"ttl":"24h"}),
+            json!({"ttl":null}),
+            json!({"prewarm":true}),
+            json!({"comparison_response_id":"resp_1"}),
+            json!([]),
+        ] {
             let response = reqwest::Client::new()
                 .post(format!("{gateway_url}/v1/responses"))
-                .json(&request)
+                .json(&json!({"model":"test","input":"hi","store":true,"prompt_cache_options":options}))
                 .send()
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let body: Value = response.json().await.unwrap();
-            assert_eq!(body["error"]["param"], "prompt_cache_options");
-            assert_eq!(
-                body["error"]["code"],
-                if supported {
-                    "invalid_value"
-                } else {
-                    "unsupported_parameter"
+        }
+        if !supported {
+            for store in [false, true] {
+                let mut request = json!({"model":"test","input":"hi","store":store,
+                    "prompt_cache_options":{"mode":"explicit"},"prompt_cache_retention":"24h"});
+                if !store {
+                    request["previous_response_id"] = json!("resp_missing");
                 }
-            );
+                let response = reqwest::Client::new()
+                    .post(format!("{gateway_url}/v1/responses"))
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["error"]["param"], "prompt_cache_options");
+                assert_eq!(body["error"]["code"], "unsupported_parameter");
+            }
         }
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM responses")
             .fetch_one(fixture.pool.as_ref())
@@ -174,5 +169,238 @@ async fn invalid_conflicting_and_unqualified_options_fail_before_upstream_or_sto
         gateway.abort();
     }
     assert!(captured.lock().await.is_empty());
+    model.abort();
+}
+
+#[tokio::test]
+async fn review_combined_cache_controls_are_forwarded_independently() {
+    let (url, captured, model) = spawn_mock_vllm_json_capture().await;
+    let mut fixture = storage_backed_state(&url).await;
+    enable_options(&mut fixture);
+    let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
+    let options = json!({"mode":"explicit","ttl":"30m"});
+    for store in [false, true] {
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_url}/v1/responses"))
+            .json(&json!({"model":"test","input":"hi","store":store,
+                "prompt_cache_retention":"24h","prompt_cache_options":options}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _: Value = response.json().await.unwrap();
+    }
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(request["prompt_cache_options"], options);
+        assert_eq!(request["prompt_cache_retention"], "24h");
+    }
+    gateway.abort();
+    model.abort();
+}
+
+#[tokio::test]
+async fn review_direct_passthrough_leaves_cache_options_to_the_upstream() {
+    let values = [
+        json!({"prewarm":true}),
+        json!({"comparison_response_id":"resp_compare"}),
+        json!({"future":{"enabled":true}}),
+        json!({"mode":"future"}),
+        json!({"mode":null}),
+        json!([]),
+        json!("opaque"),
+        json!({}),
+        Value::Null,
+    ];
+    for (stream, supported) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (url, captured, model) = if stream {
+            spawn_tool_search_sse_sequence(vec![final_message_sse(); values.len()]).await
+        } else {
+            spawn_mock_vllm_json_capture().await
+        };
+        let mut fixture = storage_backed_state(&url).await;
+        if supported {
+            enable_options(&mut fixture);
+        }
+        let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
+        for options in &values {
+            let response = reqwest::Client::new()
+                .post(format!("{gateway_url}/v1/responses"))
+                .json(&json!({"model":"test","input":"hi","store":false,"stream":stream,
+                    "prompt_cache_retention":"24h","prompt_cache_options":options}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{options}");
+            let body = response.text().await.unwrap();
+            if stream {
+                assert!(body.contains("response.completed"));
+            }
+        }
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), values.len());
+        for (request, options) in requests.iter().zip(&values) {
+            assert_eq!(request.get("prompt_cache_options"), Some(options));
+            assert_eq!(request["prompt_cache_retention"], "24h");
+        }
+        gateway.abort();
+        model.abort();
+    }
+}
+
+#[tokio::test]
+async fn review_json_and_stored_responses_echo_the_current_request_options() {
+    let (url, _captured, model) = spawn_mock_vllm_json_capture().await;
+    let mut fixture = storage_backed_state(&url).await;
+    enable_options(&mut fixture);
+    let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+    let mut parent = Value::Null;
+    for options in [
+        Some(json!({"mode":"explicit","ttl":"30m"})),
+        None,
+        Some(Value::Null),
+        Some(json!({})),
+        Some(json!({"mode":"implicit"})),
+    ] {
+        let mut request = json!({"model":"test","input":"hi","store":true});
+        if !parent.is_null() {
+            request["previous_response_id"] = parent;
+        }
+        if let Some(options) = &options {
+            request["prompt_cache_options"] = options.clone();
+        }
+        let response = client
+            .post(format!("{gateway_url}/v1/responses"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        let expected = options.unwrap_or(Value::Null);
+        assert_eq!(body.get("prompt_cache_options"), Some(&expected));
+        parent = body["id"].clone();
+        let stored: Value = client
+            .get(format!("{gateway_url}/v1/responses/{}", parent.as_str().unwrap()))
+            .bearer_auth("test-key")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stored.get("prompt_cache_options"), Some(&expected));
+    }
+    gateway.abort();
+    model.abort();
+}
+
+#[tokio::test]
+async fn review_sse_options_are_consistent_from_created_to_completed_and_storage() {
+    let mut upstream_events: Vec<Value> = final_message_sse()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let mut in_progress = upstream_events[0].clone();
+    in_progress["type"] = json!("response.in_progress");
+    upstream_events.insert(1, in_progress);
+    let upstream = encode_sse_events(upstream_events)
+        .lines()
+        .map(|line| {
+            let Some(data) = line.strip_prefix("data: ") else {
+                return line.to_owned();
+            };
+            let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                return line.to_owned();
+            };
+            if let Some(response) = event.get_mut("response").and_then(Value::as_object_mut) {
+                response.insert(
+                    "prompt_cache_options".into(),
+                    json!({"mode":"implicit","prewarm":false}),
+                );
+            }
+            format!("data: {event}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n\n";
+    // Each stored response must have independent output item identifiers.
+    let second = upstream
+        .replace("msg_final", "msg_second")
+        .replace("up_final", "up_second");
+    let (url, _captured, model) = spawn_tool_search_sse_sequence(vec![upstream, second]).await;
+    let mut fixture = storage_backed_state(&url).await;
+    enable_options(&mut fixture);
+    let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
+    let client = reqwest::Client::new();
+    for options in [Some(json!({"mode":"explicit","ttl":"30m"})), None] {
+        let mut request = json!({"model":"test","input":"hi","store":true,"stream":true});
+        if let Some(options) = &options {
+            request["prompt_cache_options"] = options.clone();
+        }
+        let response = client
+            .post(format!("{gateway_url}/v1/responses"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        let events: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        let expected = options.unwrap_or(Value::Null);
+        for kind in ["response.created", "response.in_progress", "response.completed"] {
+            let event = events
+                .iter()
+                .find(|event| event["type"] == kind)
+                .unwrap_or_else(|| panic!("missing {kind}: {events:?}"));
+            assert_eq!(event["response"].get("prompt_cache_options"), Some(&expected), "{kind}");
+        }
+        let id = events.last().unwrap()["response"]["id"].as_str().unwrap();
+        let stored: Value = client
+            .get(format!("{gateway_url}/v1/responses/{id}"))
+            .bearer_auth("test-key")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stored.get("prompt_cache_options"), Some(&expected));
+    }
+    gateway.abort();
+    model.abort();
+}
+
+#[tokio::test]
+async fn direct_cache_options_preserve_the_original_json_bytes() {
+    let (url, captured, model) = spawn_mock_vllm_json_capture_bytes().await;
+    let fixture = storage_backed_state(&url).await;
+    let (gateway_url, gateway) = spawn_gateway(fixture.state.clone()).await;
+    let wire = r#"{ "model":"test", "input":"hi", "store":false,
+        "prompt_cache_options": { "prewarm":true, "mode":"explicit", "mode":"implicit" } }"#;
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/responses"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(wire)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.unwrap();
+    assert_eq!(captured.lock().await[0].as_ref(), wire.as_bytes());
+    gateway.abort();
     model.abort();
 }

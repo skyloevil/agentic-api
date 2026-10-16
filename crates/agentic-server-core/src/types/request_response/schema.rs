@@ -181,6 +181,12 @@ impl utoipa::PartialSchema for ResponsePayload {
             .property("instructions", nullable_str())
             .property("max_tool_calls", nullable_int())
             .property("service_tier", nullable_str())
+            .property(
+                "prompt_cache_options",
+                OneOfBuilder::new()
+                    .item(<PromptCacheOptions as utoipa::PartialSchema>::schema())
+                    .item(null_type()),
+            )
             .property("tools", nullable_array(Ref::from_schema_name("ResponsesTool").into()))
             .property("tool_choice", nullable_ref("ToolChoice"))
             .into()

@@ -43,7 +43,7 @@ async fn prompt_cache_options_schema_exposes_the_closed_mode_ttl_contract() {
     assert_eq!(properties.len(), 2);
     assert!(properties.contains_key("mode"));
     assert!(properties.contains_key("ttl"));
-    for name in ["RequestPayload", "CompactRequest"] {
+    for name in ["RequestPayload", "CompactRequest", "ResponsePayload"] {
         assert!(!schemas[name]["properties"]["prompt_cache_options"].is_null());
     }
 }
