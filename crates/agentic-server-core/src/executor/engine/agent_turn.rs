@@ -333,24 +333,52 @@ impl<'a> AgentTurn<'a> {
             output_offset + payload.output.len(),
         );
 
-        // Completed gateway calls still need their outputs recorded when an
-        // incomplete response or client call prevents another inference round.
-        let decision = if payload.status == "incomplete" {
-            RoundDecision::UpstreamTerminal
-        } else {
-            classify_round(
-                client_calls,
-                &gateway_results,
-                round,
-                self.max_rounds.get(),
-                &mut self.async_continuations,
-            )
-        };
+        let decision = self.round_decision(&mut payload, client_calls, &gateway_results, round);
         if matches!(decision, RoundDecision::Continue) || multi_agent {
             self.append_round_input(&current_output, &payload.output, multi_agent);
         }
         self.record_gateway_results(gateway_results);
         Ok(RoundResult { payload, decision })
+    }
+
+    fn round_decision(
+        &mut self,
+        payload: &mut ResponsePayload,
+        client_calls: ClientCalls,
+        gateway_results: &[GatewayCallResult],
+        round: usize,
+    ) -> RoundDecision {
+        // Completed gateway calls still need their outputs recorded when an
+        // incomplete response or client call prevents another inference round.
+        let reason = payload
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref());
+        let locally_steered = self.pipeline.steering_requested() && reason == Some("steered");
+        if locally_steered && client_calls.synchronous {
+            // A completed client call still requires its actual output. Keep
+            // the ordinary completed parent available for explicit continuation.
+            "completed".clone_into(&mut payload.status);
+            payload.incomplete_details = None;
+            RoundDecision::RequiresClientAction
+        } else if payload.status == "incomplete" {
+            RoundDecision::UpstreamTerminal
+        } else if self.pipeline.steering_requested()
+            && !client_calls.synchronous
+            && (!gateway_results.is_empty() || client_calls.asynchronous)
+        {
+            // The entire admitted gateway batch has settled and its events have
+            // been emitted. Do not start another inference round after steering.
+            RoundDecision::Incomplete("steered".to_owned())
+        } else {
+            classify_round(
+                client_calls,
+                gateway_results,
+                round,
+                self.max_rounds.get(),
+                &mut self.async_continuations,
+            )
+        }
     }
 
     fn append_round_input(&mut self, output: &[OutputItem], public: &[OutputItem], multi_agent: bool) {

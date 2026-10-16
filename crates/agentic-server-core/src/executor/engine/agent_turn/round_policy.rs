@@ -9,8 +9,8 @@ use crate::types::io::OutputItem;
 /// client can return its output; an async call lets the model continue without it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ClientCalls {
-    synchronous: bool,
-    asynchronous: bool,
+    pub(super) synchronous: bool,
+    pub(super) asynchronous: bool,
 }
 
 impl ClientCalls {

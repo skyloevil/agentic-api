@@ -1023,7 +1023,7 @@ async fn a_repeated_output_after_compaction_in_a_session_keeps_its_call() {
         let ctx = fixture.exec_ctx.clone();
         async move {
             let response = match ExecuteRequest::new(request, ctx)
-                .with_session(session)
+                .with_session(session, None)
                 .unwrap()
                 .run()
                 .await
