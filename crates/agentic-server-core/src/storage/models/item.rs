@@ -6,9 +6,10 @@ use std::fmt::Write;
 use tracing::warn;
 
 use super::super::pool::{DbPool, DbResult, DbTransaction};
-use super::super::types::item::{InOutItem, ItemKind, STORED_CODE_INTERPRETER_ORIGIN_KEY, STORED_ITEM_KIND_KEY};
+use super::super::types::item::{ItemKind, STORED_CODE_INTERPRETER_ORIGIN_KEY, STORED_ITEM_KIND_KEY};
 use crate::storage::{StorageError, StoreResult};
 use crate::types::conversations::ItemOrder;
+use crate::types::io::InOutItem;
 use crate::types::io::code_interpreter::CodeInterpreterCallOrigin;
 use crate::types::io::{InputItem, OutputItem, ReasoningOutput};
 use crate::utils::common::{deserialize_from_str_opt, utcnow_str, uuid7_str};
@@ -29,6 +30,9 @@ pub struct Item {
 
     /// Original public item identity when this row references an existing item.
     pub reference_id: Option<String>,
+
+    /// Public identity of an independent history row, which keeps its own copy of the item data.
+    pub public_id: Option<String>,
 
     /// Item data stored as JSON text.
     /// Deserialized based on context (`message`, `tool_call`, etc.)
@@ -51,7 +55,10 @@ impl Item {
     /// Public identity, shared by every reference to the original item.
     #[must_use]
     pub fn public_id(&self) -> &str {
-        self.reference_id.as_deref().unwrap_or(&self.id)
+        self.public_id
+            .as_deref()
+            .or(self.reference_id.as_deref())
+            .unwrap_or(&self.id)
     }
 
     fn data_without_storage_marker(&self) -> Option<(Value, bool)> {
@@ -116,19 +123,13 @@ impl Item {
             return output.map(InOutItem::Output);
         }
 
-        let input = self.as_input();
-        if input.as_ref().is_some_and(|item| !matches!(item, InputItem::Unknown)) {
-            return input.map(InOutItem::Input);
-        }
-
-        match (input, output) {
-            (Some(input), _) => Some(InOutItem::Input(input)),
-            (_, Some(output)) => Some(InOutItem::Output(output)),
-            _ => {
+        self.as_input()
+            .map(InOutItem::Input)
+            .or_else(|| output.map(InOutItem::Output))
+            .or_else(|| {
                 warn!(item_id = %self.id, "unrecognized item type in stored data");
                 None
-            }
-        }
+            })
     }
 
     fn stored_item_kind(&self) -> Option<ItemKind> {
@@ -211,6 +212,10 @@ pub(crate) fn serialize_new_items(items: Vec<InOutItem>, source: ItemSource) -> 
 /// If `conversation_id` is provided, the next sequence range is computed in the insert statement so
 /// concurrent `SQLite` writers do not take a stale read snapshot before writing.
 ///
+/// Without a conversation, each item is an independent response-history row: it receives a fresh
+/// row ID and keeps the supplied ID as its public identity, so a repeated public ID can be stored
+/// once per occurrence. Rows are returned in input order.
+///
 /// # Errors
 /// Returns an error if insertion fails or an item already belongs to the conversation.
 pub async fn create_in_tx(
@@ -249,20 +254,28 @@ async fn create_in_tx_without_conversation(
     tx: &mut DbTransaction<'_>,
     items: &[(String, String)],
 ) -> DbResult<Vec<Item>> {
+    // Each occurrence gets a fresh row ID; the supplied ID is public and may repeat.
     let now = utcnow_str();
-    let values_clause = item_values_clause(items.len(), 1, false);
+    let row_ids = items.iter().map(|_| uuid7_str("item_")).collect::<Vec<_>>();
+    let values_clause = (0..items.len())
+        .map(|index| format!("($1, ${}, ${}, ${})", 3 * index + 2, 3 * index + 3, 3 * index + 4))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
-        "WITH incoming (id, data, created_at, conversation_id, seq) AS (VALUES {values_clause}) \
-                 INSERT INTO items (id, data, created_at, conversation_id, seq, tenant_id) \
-                 SELECT incoming.*, 'default_tenant' FROM incoming RETURNING *"
+        "WITH incoming (created_at, id, public_id, data) AS (VALUES {values_clause}) \
+         INSERT INTO items (id, public_id, data, created_at, tenant_id) \
+         SELECT id, public_id, data, created_at, 'default_tenant' FROM incoming RETURNING *"
     );
 
-    let mut query = sqlx::query_as::<_, Item>(&sql);
-    for (id, data) in items {
-        query = query.bind(id).bind(data).bind(now).bind(None::<&str>).bind(None::<i64>);
+    let mut query = sqlx::query_as::<_, Item>(&sql).bind(now);
+    for ((public_id, data), row_id) in items.iter().zip(&row_ids) {
+        query = query.bind(row_id).bind(public_id).bind(data);
     }
 
-    query.fetch_all(&mut **tx).await
+    let mut rows = query.fetch_all(&mut **tx).await?;
+    // `RETURNING` does not promise output order; restore it so history matches the request.
+    rows.sort_by_key(|row| row_ids.iter().position(|id| id == &row.id));
+    Ok(rows)
 }
 
 async fn create_in_tx_with_next_conversation_seq(
@@ -273,6 +286,7 @@ async fn create_in_tx_with_next_conversation_seq(
 ) -> StoreResult<Vec<Item>> {
     let now = utcnow_str();
     let values_clause = item_values_clause(items.len(), 3, true);
+    // A repeated public ID resolves to the row whose own ID matches it, else the earliest one.
     let sql = format!(
         "WITH next_seq AS ( \
              SELECT COALESCE(MAX(seq), -1) + 1 AS start FROM items WHERE conversation_id = $1 \
@@ -280,17 +294,27 @@ async fn create_in_tx_with_next_conversation_seq(
              VALUES {values_clause} \
          ), owner AS ( \
              SELECT COALESCE(tenant_id, 'default_tenant') AS tenant_id FROM conversations WHERE id = $1 \
+         ), source_rows AS ( \
+             SELECT incoming.seq AS incoming_seq, \
+                    COALESCE(MIN(CASE WHEN source.id = incoming.id THEN source.id END), MIN(source.id)) AS source_id \
+             FROM incoming CROSS JOIN owner JOIN items source \
+                 ON COALESCE(source.public_id, source.reference_id, source.id) = incoming.id \
+                AND source.tenant_id = owner.tenant_id \
+                AND (CAST($2 AS BIGINT) IS NULL OR source.conversation_id IS NULL \
+                     OR source.conversation_id <> $1 OR source.seq < $2) \
+             GROUP BY incoming.seq \
          ) \
-         INSERT INTO items (id, data, created_at, conversation_id, seq, reference_id, tenant_id) \
+         INSERT INTO items (id, data, created_at, conversation_id, seq, reference_id, public_id, tenant_id) \
          SELECT CASE WHEN source.id IS NULL THEN incoming.id ELSE incoming.entry_id END, \
                 COALESCE(source.data, incoming.data), COALESCE(source.created_at, incoming.created_at), \
-                incoming.conversation_id, incoming.seq, source.id, owner.tenant_id \
+                incoming.conversation_id, incoming.seq, source.id, \
+                COALESCE(source.public_id, source.reference_id, source.id, incoming.id), owner.tenant_id \
          FROM incoming CROSS JOIN owner \
-         LEFT JOIN items source ON source.id = incoming.id AND source.tenant_id = owner.tenant_id \
-             AND (CAST($2 AS BIGINT) IS NULL OR source.conversation_id IS NULL \
-                  OR source.conversation_id <> $1 OR source.seq < $2) \
+         LEFT JOIN source_rows ON source_rows.incoming_seq = incoming.seq \
+         LEFT JOIN items source ON source.id = source_rows.source_id \
          WHERE NOT EXISTS ( \
-             SELECT 1 FROM items existing JOIN incoming ON incoming.id = COALESCE(existing.reference_id, existing.id) \
+             SELECT 1 FROM items existing \
+             JOIN incoming ON incoming.id = COALESCE(existing.public_id, existing.reference_id, existing.id) \
              WHERE existing.conversation_id = $1 \
                AND (CAST($2 AS BIGINT) IS NULL OR existing.seq < $2) \
          ) \
@@ -405,7 +429,7 @@ pub async fn list_for_conversation(
         // occurrence in this ordering so the public cursor cannot loop forever.
         let cursor_direction = if order == ItemOrder::Asc { "DESC" } else { "ASC" };
         let cursor_query = format!(
-            "{base} AND COALESCE(items.reference_id, items.id) = $3 \
+            "{base} AND COALESCE(items.public_id, items.reference_id, items.id) = $3 \
              ORDER BY items.seq {cursor_direction}, items.id {cursor_direction} LIMIT 1"
         );
         let cursor = sqlx::query_as::<_, Item>(&cursor_query)
@@ -447,7 +471,8 @@ pub async fn get_for_conversation(
 ) -> DbResult<Option<Item>> {
     sqlx::query_as(
         "SELECT items.* FROM items JOIN conversations ON conversations.id = items.conversation_id \
-         WHERE conversations.id = $1 AND conversations.tenant_id = $2 AND COALESCE(items.reference_id, items.id) = $3 \
+         WHERE conversations.id = $1 AND conversations.tenant_id = $2 \
+           AND COALESCE(items.public_id, items.reference_id, items.id) = $3 \
          ORDER BY items.seq ASC LIMIT 1",
     )
     .bind(conversation_id)
@@ -468,7 +493,7 @@ pub async fn detach_from_conversation_in_tx(
 ) -> DbResult<u64> {
     let result = sqlx::query(
         "UPDATE items SET conversation_id = NULL, seq = NULL \
-         WHERE conversation_id = $1 AND (CAST($2 AS TEXT) IS NULL OR COALESCE(reference_id, id) = $2)",
+         WHERE conversation_id = $1 AND (CAST($2 AS TEXT) IS NULL OR COALESCE(public_id, reference_id, id) = $2)",
     )
     .bind(conversation_id)
     .bind(item_id)
@@ -597,6 +622,7 @@ mod tests {
                     seq: None,
                     tenant_id: None,
                     reference_id: None,
+                    public_id: None,
                 }
                 .as_inout()
                 .expect("rehydrate stored item")
@@ -611,7 +637,7 @@ mod tests {
             && call.code == "print(7)" && call.outputs.as_ref().is_some_and(|outputs| outputs.len() == 1))
         );
         let model_input =
-            serde_json::to_value(ResponsesInput::Items(inputs).model_input()).expect("model input serializes");
+            serde_json::to_value(ResponsesInput::from(inputs).model_input()).expect("model input serializes");
         assert_eq!(model_input[2]["type"], "code_interpreter_call");
         assert!(model_input[2].get(STORED_CODE_INTERPRETER_ORIGIN_KEY).is_none());
     }
@@ -667,16 +693,42 @@ mod tests {
         let items = (0..=MAX_BIND_PARAMETERS)
             .map(|index| (format!("item_{index}"), "{}".to_owned()))
             .collect::<Vec<_>>();
-        let ids = items.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let public_ids = items.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
         let mut transaction = pool.begin().await.expect("begin transaction");
         let created = create_in_tx(&mut transaction, items, None)
             .await
             .expect("insert item batches");
         transaction.commit().await.expect("commit item batches");
-        let loaded = get_items(&pool, &ids).await.expect("load item batches");
+        let row_ids = created.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let loaded = get_items(&pool, &row_ids).await.expect("load item batches");
 
         assert_eq!(created.len(), MAX_BIND_PARAMETERS + 1);
         assert_eq!(loaded.len(), MAX_BIND_PARAMETERS + 1);
+        assert_eq!(
+            created.iter().map(Item::public_id).collect::<Vec<_>>(),
+            public_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(created.iter().all(|item| item.id != item.public_id()));
+    }
+
+    #[tokio::test]
+    async fn repeated_public_ids_get_distinct_history_rows() {
+        let pool = crate::storage::create_pool_with_schema(Some("sqlite://?mode=memory"))
+            .await
+            .expect("create in-memory database");
+        let items = vec![("item_repeated".to_owned(), "{}".to_owned()); 2];
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        let created = create_in_tx(&mut transaction, items, None)
+            .await
+            .expect("insert repeated public ids");
+        transaction.commit().await.expect("commit history rows");
+
+        assert_eq!(created.len(), 2);
+        assert_ne!(created[0].id, created[1].id);
+        assert_eq!(created[0].public_id(), "item_repeated");
+        assert_eq!(created[1].public_id(), "item_repeated");
+        let row_ids = created.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        assert_eq!(get_items(&pool, &row_ids).await.expect("reload history rows").len(), 2);
     }
 
     #[tokio::test]
@@ -728,6 +780,7 @@ mod tests {
             seq: Some(1),
             tenant_id: None,
             reference_id: None,
+            public_id: None,
         };
 
         assert_eq!(item.id, "item_123");
@@ -745,6 +798,7 @@ mod tests {
             seq: None,
             tenant_id: None,
             reference_id: None,
+            public_id: None,
         };
 
         assert!(item.conversation_id.is_none());
@@ -774,6 +828,7 @@ mod tests {
             seq: None,
             tenant_id: None,
             reference_id: None,
+            public_id: None,
         };
 
         let Some(InOutItem::Output(OutputItem::Reasoning(reasoning))) = item.as_inout() else {
@@ -812,6 +867,7 @@ mod tests {
             seq: None,
             tenant_id: None,
             reference_id: None,
+            public_id: None,
         };
 
         let stored = item.as_inout().expect("stored item");
@@ -841,6 +897,7 @@ mod tests {
             seq: None,
             tenant_id: None,
             reference_id: None,
+            public_id: None,
         };
 
         let inputs = InOutItem::into_input_items(vec![item.as_inout().expect("stored item")]);
@@ -878,6 +935,7 @@ mod tests {
             seq: None,
             tenant_id: None,
             reference_id: None,
+            public_id: None,
         };
 
         let inputs = InOutItem::into_input_items(vec![item.as_inout().expect("stored shell item")]);
@@ -926,6 +984,7 @@ mod tests {
                 seq: Some(idx.try_into().expect("seq")),
                 tenant_id: None,
                 reference_id: None,
+                public_id: None,
             })
             .map(|item| item.as_inout().expect("stored item"))
             .collect();
@@ -961,6 +1020,7 @@ mod tests {
             seq: None,
             tenant_id: None,
             reference_id: None,
+            public_id: None,
         };
 
         let inputs = InOutItem::into_input_items(vec![item.as_inout().expect("stored item")]);
@@ -972,13 +1032,35 @@ mod tests {
 #[cfg(test)]
 mod item_id_tests {
     use super::*;
-    use crate::types::conversations::ConversationItem;
     use serde_json::json;
 
     fn stored(value: serde_json::Value) -> InOutItem {
-        match serde_json::from_value::<ConversationItem>(value).unwrap() {
-            ConversationItem::Input(item) => InOutItem::Input(item),
-            ConversationItem::Output(item) => InOutItem::Output(item),
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn submitted_gateway_calls_remain_inputs_after_storage_round_trip() {
+        for wire in [
+            json!({"type":"web_search_call", "id":"ws_1", "status":"completed", "action":{"type":"search", "query":"weather"}}),
+            json!({"type":"mcp_call", "id":"mcp_1", "server_label":"weather", "name":"forecast", "arguments":"{}", "output":"sunny"}),
+        ] {
+            let input = stored(wire);
+            let expected = serde_json::to_value(&input).unwrap();
+            let row = Item {
+                id: "row_1".to_owned(),
+                reference_id: None,
+                public_id: None,
+                data: String::try_from(&input).unwrap(),
+                created_at: 0,
+                conversation_id: None,
+                seq: None,
+                tenant_id: None,
+            };
+            let restored = row.as_inout().unwrap();
+            assert!(matches!(restored, InOutItem::Input(_)));
+            let replay = InOutItem::into_input_items(vec![restored]);
+            assert_eq!(replay.len(), 1);
+            assert_eq!(serde_json::to_value(&replay[0]).unwrap(), expected);
         }
     }
 

@@ -1,7 +1,7 @@
 use super::{TOOL_SEARCH_NAME, ToolSearchHandler};
 use crate::tool::ToolError;
 use crate::tool::declaration::responses_declarations;
-use crate::types::io::{InputItem, ResponsesInput};
+use crate::types::io::{InOutItem, InputItem, ResponsesInput};
 use crate::types::request_response::RequestPayload;
 use crate::types::tools::{CodexNamespaceMember, ResponsesTool};
 
@@ -61,7 +61,8 @@ pub(super) fn input_contains_tool_search_state(input: &ResponsesInput) -> bool {
         ResponsesInput::Items(items)
             if items
                 .iter()
-                .any(|item| matches!(item, InputItem::ToolSearchCall(_) | InputItem::ToolSearchOutput(_)))
+                .filter_map(InOutItem::as_input)
+                .any(|item| matches!(&*item, InputItem::ToolSearchCall(_) | InputItem::ToolSearchOutput(_)))
     )
 }
 

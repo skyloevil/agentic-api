@@ -8,13 +8,13 @@ pub mod request_response;
 pub mod tools;
 
 pub use conversations::{
-    ConversationItem, ConversationResponse, CreateConversationRequest, CreateItemRequest, DeletedResponse,
-    ItemResponse, ListItemsResponse, UpdateConversationRequest,
+    ConversationResponse, CreateConversationRequest, CreateItemRequest, DeletedResponse, ItemResponse,
+    ListItemsResponse, UpdateConversationRequest,
 };
 pub use io::{
     AllowedTool, AllowedToolsMode, CodeInterpreterCall, CodeInterpreterCallOutput, CodeInterpreterCallStatus,
     CodeInterpreterCallStreamEvent, CompactionItem, CustomToolCall, CustomToolCallOutputMessage, FunctionTool,
-    FunctionToolCall, FunctionToolResultMessage, GatewayCallStatus, InputContent, InputFileContent,
+    FunctionToolCall, FunctionToolResultMessage, GatewayCallStatus, InOutItem, InputContent, InputFileContent,
     InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputTextContent,
     InputTokenDetails, InputToolSearchCall, McpCall, McpCallError, McpCallStatus, McpToolExecutionError,
     McpToolExecutionErrorContent, OpaqueReasoning, OpaqueReasoningError, OutputItem, OutputMessage, OutputTextContent,

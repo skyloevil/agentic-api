@@ -3,8 +3,10 @@
 
 use serde_json::{Value, json};
 
+use crate::executor::gateway::GatewaySchedulerPolicy;
 use crate::executor::messages_context::MessagesRequestContext;
 use crate::executor::messages_tools::{self, GatewayToolUse};
+use crate::executor::telemetry::metrics::ExecutorMetrics;
 use crate::tool::ToolRegistry;
 use crate::types::messages::{GatewayToolResult, tool_seam};
 
@@ -81,6 +83,8 @@ pub(super) async fn execute_gateway_calls(
     ctx: &mut MessagesRequestContext,
     registry: &ToolRegistry,
     gateway_map: &tool_seam::GatewayToolMap,
+    policy: &GatewaySchedulerPolicy,
+    metrics: &ExecutorMetrics,
 ) -> Vec<GatewayToolResult> {
     let tool_uses = calls
         .iter()
@@ -92,5 +96,5 @@ pub(super) async fn execute_gateway_calls(
             input: tool_seam::parse_tool_input(&call.input_json),
         })
         .collect();
-    messages_tools::execute_gateway_calls(tool_uses, ctx, registry, gateway_map).await
+    messages_tools::execute_gateway_calls(tool_uses, ctx, registry, gateway_map, policy, metrics).await
 }

@@ -7,10 +7,11 @@ use super::models::{conversation, item, response};
 use super::pool::DbPool;
 use super::types::response::decode_metadata;
 use super::types::{
-    ConversationData, ConversationSnapshot, ConversationVersion, InOutItem, ResponseMetadata, StorageError, StoreResult,
+    ConversationData, ConversationSnapshot, ConversationVersion, ResponseMetadata, StorageError, StoreResult,
 };
 use crate::storage::{DbTransaction, Item};
 use crate::types::conversations::{ConversationMetadata, ItemOrder};
+use crate::types::io::InOutItem;
 use crate::utils::common::{serialize_to_string, uuid7_str};
 
 /// Conversation storage operations.

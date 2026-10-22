@@ -21,6 +21,7 @@ use crate::types::{
     request_response::IncompleteDetails,
     tools::ToolSearchStatus,
 };
+use std::borrow::Cow;
 
 use super::{
     CompletedRound, CompletedWork, MAX_RUN_ROUNDS, MultiAgentRun, call_error, invalid, mail_input, registry_error,
@@ -115,7 +116,7 @@ impl MultiAgentRun {
         }
         let context = &self.contexts[&turn.agent];
         let mut request = context.request.clone();
-        request.input = ResponsesInput::Items(context.stored.history.clone());
+        request.input = ResponsesInput::from(context.stored.history.clone());
         let refresh_tools = context.discovery_dirty;
         let tool_search = if refresh_tools {
             // Live client discovery adds public outputs to only the owner's history.
@@ -280,10 +281,7 @@ impl MultiAgentRun {
             .get_mut(&turn.agent)
             .expect("completed work has a canonical context");
         context.execution = execution;
-        context.stored.history = match &request.input {
-            ResponsesInput::Items(items) => items.clone(),
-            ResponsesInput::Text(_) => Vec::from(&request.input),
-        };
+        context.stored.history = request.input.input_items().map(Cow::into_owned).collect();
         context.stored.history.append(&mut context.inputs_during_round);
         context.generation += 1;
         context.request = request;

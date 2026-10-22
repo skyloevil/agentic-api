@@ -285,7 +285,7 @@ impl GatewayScheduler {
         &mut self,
         response_budget: &ExecutorResponseBudget,
     ) -> ExecutorResult<Vec<GatewayCallResult>> {
-        let execution_slots = Semaphore::new(self.policy.max_concurrent_calls.get());
+        let execution_slots = self.policy.new_round_execution_slots();
         let results = join_all(
             self.calls
                 .iter()
@@ -349,12 +349,7 @@ impl GatewayScheduler {
                 .map(|result| (result, GatewayCallStatus::Failed));
         };
 
-        let _permit = match &binding.self_exclusion {
-            Some(semaphore) => Some(semaphore.acquire().await.expect("semaphore is never closed")),
-            None => None,
-        };
-        let _execution_slot = execution_slots.acquire().await.expect("semaphore is never closed");
-        let _materialization_permit = self.policy.acquire_materialization_permit().await;
+        let _permits = self.policy.acquire_execution_permits(&binding, execution_slots).await;
 
         let dispatched = if self.timeout.is_zero() {
             binding.execute(&call.call_id, &call.name, &call.arguments).await
@@ -540,8 +535,8 @@ mod tests {
     use crate::executor::relay::{RelayLimits, StreamRelay};
     use crate::types::io::output::{FunctionToolCall, McpListTool, McpListTools};
     use crate::types::io::{
-        CodeInterpreterCall, CodeInterpreterCallOutput, CodeInterpreterCallStatus, CompactionItem, InputItem,
-        McpCallStatus,
+        CodeInterpreterCall, CodeInterpreterCallOutput, CodeInterpreterCallStatus, CompactionItem, InOutItem,
+        InputItem, McpCallStatus,
     };
     use tokio::sync::{Notify, Semaphore, mpsc};
 
@@ -1610,11 +1605,11 @@ mod tests {
 
         // Emitting SSE frames must not turn the typed gateway projection into
         // an upstream-native call when the response is stored for continuation.
-        let stored = String::try_from(&crate::storage::InOutItem::Output(final_item))
-            .expect("store streamed gateway projection");
+        let stored = String::try_from(&InOutItem::Output(final_item)).expect("store streamed gateway projection");
         let item = crate::storage::models::item::Item {
             id: "ci_1".to_owned(),
             reference_id: None,
+            public_id: None,
             data: stored,
             created_at: 0,
             conversation_id: None,
@@ -1622,7 +1617,7 @@ mod tests {
             tenant_id: None,
         };
         let history = vec![item.as_inout().expect("rehydrate streamed projection")];
-        assert!(crate::storage::InOutItem::into_input_items(history).is_empty());
+        assert!(InOutItem::into_input_items(history).is_empty());
         let public = serde_json::to_value(item.as_output().expect("public output")).expect("serialize public item");
         assert!(public.get("_agentic_code_interpreter_origin").is_none());
     }

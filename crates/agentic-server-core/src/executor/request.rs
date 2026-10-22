@@ -13,7 +13,7 @@ use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
 };
 use crate::tool::{GatewayExecutorRegistration, GatewayExecutors};
-use crate::types::io::{InputItem, ToolChoice};
+use crate::types::io::{InOutItem, ToolChoice};
 use crate::types::messages::GatewayToolMap;
 use crate::types::request_response::{RequestPayload, ResponsePayload};
 
@@ -36,7 +36,7 @@ pub struct RequestContext {
     /// This turn's canonical input items for persistence, including built-in calls
     /// and call outputs. Session execution also records each round's other output
     /// items here in inference order; compaction can replace them with a new window.
-    pub new_input_items: Vec<InputItem>,
+    pub new_input_items: Vec<InOutItem>,
     /// Our generated response ID (uuid7 with "resp_" prefix).
     pub response_id: String,
     /// Resolved conversation ID. `None` when `store=false` or non-conversational.

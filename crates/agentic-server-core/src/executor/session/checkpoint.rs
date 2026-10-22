@@ -9,7 +9,8 @@ use tokio::sync::Notify;
 
 use super::{CheckpointBudget, CheckpointReservation, ExecutorError, ExecutorResult, SessionState};
 use super::{aggregate_budget_error, lock_state};
-use crate::storage::{InOutItem, ResponseMetadata};
+use crate::storage::ResponseMetadata;
+use crate::types::io::InOutItem;
 use crate::types::io::input::{async_records, retain_window};
 use crate::types::io::{InputItem, OutputItem};
 use crate::types::websocket::SteeringRequiredInput;

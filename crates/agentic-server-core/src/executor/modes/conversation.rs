@@ -1,10 +1,10 @@
 //! Conversation storage handler — owns all conversation store operations.
 
 use crate::storage::{
-    ConversationData, ConversationSnapshot, ConversationStore, ConversationVersion, InOutItem, Item, ResponseMetadata,
-    StorageError,
+    ConversationData, ConversationSnapshot, ConversationStore, ConversationVersion, ResponseMetadata, StorageError,
 };
-use crate::types::conversations::{ConversationItem, ConversationMetadata, ItemResponse, ListItemsResponse};
+use crate::types::conversations::{ConversationMetadata, ItemResponse, ListItemsResponse};
+use crate::types::io::InOutItem;
 use crate::types::io::OutputItem;
 
 use super::CommittedResponse;
@@ -84,14 +84,13 @@ impl ConversationHandler {
         &self,
         tenant_id: &str,
         metadata: Option<ConversationMetadata>,
-        items: Vec<ConversationItem>,
+        items: Vec<InOutItem>,
     ) -> ExecutorResult<ConversationData> {
         if items.len() > 20 {
             return Err(ExecutorError::InvalidRequest(
                 "a conversation accepts at most 20 initial items".into(),
             ));
         }
-        let items = items.into_iter().map(into_stored_item).collect();
         self.store
             .create_with_metadata_and_items(Some(tenant_id), metadata, items)
             .await
@@ -194,7 +193,7 @@ impl ConversationHandler {
         &self,
         tenant_id: &str,
         conversation_id: &str,
-        items: Vec<ConversationItem>,
+        items: Vec<InOutItem>,
     ) -> ExecutorResult<Vec<ItemResponse>> {
         if items.is_empty() || items.len() > 20 {
             return Err(ExecutorError::InvalidRequest(
@@ -202,18 +201,16 @@ impl ConversationHandler {
             ));
         }
 
-        let stored_items: Vec<InOutItem> = items.into_iter().map(into_stored_item).collect();
-
         let created = self
             .store
-            .create_items(tenant_id, conversation_id, stored_items)
+            .create_items(tenant_id, conversation_id, items)
             .await
             .map_err(ExecutorError::Storage)?;
 
         // Perform fallible conversion - propagate errors instead of silently dropping items
         let mut item_responses = Vec::with_capacity(created.len());
         for db_item in created {
-            let conversation_item = convert_item(&db_item)?;
+            let conversation_item = InOutItem::try_from(&db_item)?;
             item_responses.push(ItemResponse::new(db_item.public_id().to_owned(), conversation_item));
         }
 
@@ -261,7 +258,7 @@ impl ConversationHandler {
         // Perform fallible conversion - propagate errors instead of silently dropping items
         let mut item_responses = Vec::with_capacity(items.len());
         for db_item in items {
-            let conversation_item = convert_item(&db_item)?;
+            let conversation_item = InOutItem::try_from(&db_item)?;
             item_responses.push(ItemResponse::new(db_item.public_id().to_owned(), conversation_item));
         }
 
@@ -284,7 +281,7 @@ impl ConversationHandler {
             .await
             .map_err(ExecutorError::Storage)?;
 
-        let conversation_item = convert_item(&db_item)?;
+        let conversation_item = InOutItem::try_from(&db_item)?;
         Ok(ItemResponse::new(db_item.public_id().to_owned(), conversation_item))
     }
 
@@ -348,7 +345,7 @@ impl ConversationHandler {
             .ok_or_else(|| ExecutorError::InvalidRequest("conversation version is required for execute_turn".into()))?;
 
         let mut new_items = Vec::with_capacity(ctx.new_input_items.len() + output_items.len());
-        new_items.extend(ctx.new_input_items.into_iter().map(InOutItem::Input));
+        new_items.extend(ctx.new_input_items);
         new_items.extend(output_items.into_iter().map(InOutItem::Output));
 
         self.store
@@ -365,28 +362,6 @@ impl ConversationHandler {
                 source @ StorageError::ConversationConflict { .. } => ExecutorError::ConversationLocked { source },
                 other => ExecutorError::Storage(other),
             })
-    }
-}
-
-/// Converts a stored Item to a `ConversationItem` with fallible error handling.
-///
-/// # Errors
-/// Returns `ExecutorError` if the stored item cannot be deserialized.
-fn convert_item(item: &Item) -> ExecutorResult<ConversationItem> {
-    let io_item = item
-        .as_inout()
-        .ok_or_else(|| ExecutorError::InvalidRequest("Failed to deserialize stored item".into()))?;
-
-    match io_item {
-        InOutItem::Input(item_input) => Ok(ConversationItem::Input(item_input)),
-        InOutItem::Output(item_output) => Ok(ConversationItem::Output(item_output)),
-    }
-}
-
-fn into_stored_item(item: ConversationItem) -> InOutItem {
-    match item {
-        ConversationItem::Input(input) => InOutItem::Input(input),
-        ConversationItem::Output(output) => InOutItem::Output(output),
     }
 }
 
@@ -465,7 +440,7 @@ mod tests {
         let conversation = store.create().await?;
         let handler = ConversationHandler::new(store.clone());
         let mut ctx = make_ctx(Some(&conversation.conversation_id));
-        ctx.new_input_items = Vec::from(&ctx.original_request.input);
+        ctx.new_input_items = ctx.original_request.input.clone().into_canonical_items();
 
         let error = handler
             .execute_turn(ctx, vec![])
@@ -490,7 +465,7 @@ mod tests {
         let conversation = store.create().await?;
         let handler = ConversationHandler::new(store.clone());
         let mut ctx = make_ctx(Some(&conversation.conversation_id));
-        ctx.new_input_items = Vec::from(&ctx.original_request.input);
+        ctx.new_input_items = ctx.original_request.input.clone().into_canonical_items();
         ctx.conversation_version = Some(ConversationVersion::default());
         ctx.enriched_request.tool_choice = Some(ToolChoice::Required);
         ctx.relax_tool_choice();
@@ -524,7 +499,7 @@ mod tests {
         let conversation = store.create().await?;
         let handler = ConversationHandler::new(store.clone());
         let mut ctx = make_ctx(Some(&conversation.conversation_id));
-        ctx.new_input_items = Vec::from(&ctx.original_request.input);
+        ctx.new_input_items = ctx.original_request.input.clone().into_canonical_items();
         ctx.conversation_version = Some(ConversationVersion::default());
         let competing_items = Vec::from(&ResponsesInput::Text("competing input".into()))
             .into_iter()

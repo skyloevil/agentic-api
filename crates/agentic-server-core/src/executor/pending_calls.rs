@@ -11,6 +11,8 @@
 //! does not change a call already made.
 
 use indexmap::IndexMap;
+#[cfg(test)]
+use std::borrow::Cow;
 
 use super::{ExecutorError, ExecutorResult};
 use crate::tool::{ToolError, shell::SHELL_FUNCTION_NAME};
@@ -267,7 +269,8 @@ fn scan_calls(items: &[InputItem]) -> ExecutorResult<CallLedger> {
             | InputItem::MultiAgentCall(_)
             | InputItem::MultiAgentCallOutput(_)
             | InputItem::AgentMessage(_)
-            | InputItem::Unknown => {}
+            | InputItem::WebSearchCall(_)
+            | InputItem::McpCall(_) => {}
         }
         if ledger.unresolved_sync == 0 {
             ledger.resolved_prefix = index + 1;
@@ -286,11 +289,11 @@ mod tests {
     #[test]
     fn compaction_prefix_never_splits_interleaved_calls_and_outputs() {
         let items = vec![
-            InputItem::Unknown,
+            InputItem::CompactionTrigger,
             function_call("a"),
             function_call("b"),
             function_call_output("a"),
-            InputItem::Unknown,
+            InputItem::CompactionTrigger,
         ];
         assert_eq!(resolved_prefix_len(&items).unwrap(), 1);
         let mut resolved = items;
@@ -595,18 +598,17 @@ mod tests {
                         if output_type == "tool_search_output" {
                             expected["execution"] = serde_json::json!("client");
                         }
-                        let input = ResponsesInput::Items(vec![deserialize_from_value(item.clone()).unwrap()]);
-                        let normalized = input.normalized_model_input();
+                        let input =
+                            ResponsesInput::from(vec![deserialize_from_value::<InputItem>(item.clone()).unwrap()]);
+                        let normalized = input.normalized_model_input().unwrap();
                         for history in [&input, normalized.as_ref()] {
-                            let ResponsesInput::Items(items) = history else {
-                                unreachable!()
-                            };
-                            let required = pending_calls(items)
-                                .unwrap()
-                                .pop()
-                                .unwrap()
-                                .into_steering_required_input(&tools)
-                                .unwrap();
+                            let required =
+                                pending_calls(&history.input_items().map(Cow::into_owned).collect::<Vec<_>>())
+                                    .unwrap()
+                                    .pop()
+                                    .unwrap()
+                                    .into_steering_required_input(&tools)
+                                    .unwrap();
                             assert_eq!(
                                 serialize_to_value(&required).unwrap(),
                                 expected,
@@ -748,11 +750,11 @@ mod tests {
     #[test]
     fn pending_async_calls_do_not_end_the_resolved_prefix() {
         let items = vec![
-            InputItem::Unknown,
+            InputItem::CompactionTrigger,
             async_function_call("call_async"),
-            InputItem::Unknown,
+            InputItem::CompactionTrigger,
             function_call("call_sync"),
-            InputItem::Unknown,
+            InputItem::CompactionTrigger,
         ];
         assert_eq!(
             resolved_prefix_len(&items).unwrap(),

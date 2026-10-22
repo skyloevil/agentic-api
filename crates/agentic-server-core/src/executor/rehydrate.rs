@@ -9,59 +9,14 @@ use crate::executor::multi_agent::{CheckpointLimits, ValidatedTreeCheckpoint};
 use crate::executor::pending_calls::first_unanswered_sync_call;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::telemetry::metrics::Stage;
-use crate::storage::{InOutItem, ResponseMetadata};
+use crate::storage::ResponseMetadata;
 use crate::tool::ToolError;
+use crate::types::io::InOutItem;
 use crate::types::io::{
-    InputContent, InputItem, InputMessageContent, ReasoningOutput, ReasoningTextContent, ResponsesInput,
-    resolve_tool_choice, resolve_tools,
+    InputItem, OutputItem, ReasoningOutput, ReasoningTextContent, ResponsesInput, resolve_tool_choice, resolve_tools,
 };
 use crate::types::request_response::RequestPayload;
 use crate::utils::uuid7_str;
-
-/// Reject message content the typed executor cannot convey, including restored history.
-///
-/// Keep this out of deserialization: eligible raw proxy requests must retain their
-/// original bytes and leave support decisions to the upstream. Structured tool
-/// call outputs have a separate content type and are deliberately not rejected.
-///
-/// A part is rejected rather than dropped so a message is never mutated in
-/// transit: `input_file` because support is decided after routing, an unmodeled
-/// type because it cannot be forwarded or persisted without inventing a
-/// synthetic part, and an empty part array because the turn would carry nothing.
-pub(super) fn validate_message_content(input: &ResponsesInput) -> ExecutorResult<()> {
-    let ResponsesInput::Items(items) = input else {
-        return Ok(());
-    };
-    for (item_index, item) in items.iter().enumerate() {
-        let InputItem::Message(message) = item else {
-            continue;
-        };
-        let InputMessageContent::Parts(parts) = &message.content else {
-            continue;
-        };
-        if parts.is_empty() {
-            return Err(ExecutorError::InvalidRequest(format!(
-                "input[{item_index}].content: a message must contain at least one content part"
-            )));
-        }
-        for (part_index, part) in parts.iter().enumerate() {
-            let unsupported = match part {
-                InputContent::InputFile(_) => "input_file",
-                InputContent::Unknown(kind) => kind.as_str(),
-                InputContent::InputText(_)
-                | InputContent::InputImage(_)
-                | InputContent::OutputText(_)
-                | InputContent::Refusal(_)
-                | InputContent::ReasoningText(_) => continue,
-            };
-            return Err(ExecutorError::InvalidRequest(format!(
-                "input[{item_index}].content[{part_index}]: message content part type `{unsupported}` is not \
-                 supported by the typed Responses executor; provide input_text or input_image content instead"
-            )));
-        }
-    }
-    Ok(())
-}
 
 fn has_plaintext_reasoning(reasoning: &ReasoningOutput) -> bool {
     reasoning.content.iter().any(|content| !content.text.is_empty())
@@ -78,7 +33,7 @@ pub(super) fn validate_reasoning_for_vllm(input: &ResponsesInput) -> ExecutorRes
     };
 
     if items.iter().any(|item| {
-        matches!(item, InputItem::Reasoning(reasoning) if has_opaque_reasoning_state(reasoning) && !has_plaintext_reasoning(reasoning))
+        matches!(item, InOutItem::Input(InputItem::Reasoning(reasoning)) | InOutItem::Output(OutputItem::Reasoning(reasoning)) if has_opaque_reasoning_state(reasoning) && !has_plaintext_reasoning(reasoning))
     }) {
         return Err(ExecutorError::InvalidRequest(
             "reasoning item contains encrypted state without plaintext reasoning content and cannot be replayed to vLLM"
@@ -106,7 +61,9 @@ pub(super) fn prepare_reasoning_for_vllm(input: &mut ResponsesInput) -> Executor
     };
 
     items.retain_mut(|item| {
-        let InputItem::Reasoning(reasoning) = item else {
+        let (InOutItem::Input(InputItem::Reasoning(reasoning)) | InOutItem::Output(OutputItem::Reasoning(reasoning))) =
+            item
+        else {
             return true;
         };
         if !has_plaintext_reasoning(reasoning) {
@@ -182,6 +139,8 @@ async fn rehydrate_request(
     continuation: Option<ResponseContinuation>,
 ) -> ExecutorResult<RequestContext> {
     request.validate_prompt_cache_options(exec_ctx.responses_config.prompt_cache_options_supported)?;
+    // Every typed entry point reaches this check: executor-routed HTTP, WebSocket, split execution, embedders.
+    request.ensure_supported_parameters()?;
     validate_multi_agent_request(&request)?;
     // Stored turns never supply `max_tool_calls`, so the request value is final here.
     request.max_tool_calls_limit()?;
@@ -190,14 +149,11 @@ async fn rehydrate_request(
     exec_ctx
         .gateway_executors
         .validate_declarations(request.tool_declarations().as_deref())?;
-    validate_message_content(&request.input)?;
+    request.input.validate()?;
     let response_id = uuid7_str("resp_");
     // Persistence keeps the public items. Tool lowering belongs to the enriched
     // inference copy, including when a later turn loads these items from storage.
-    let new_input_items = match &request.input {
-        ResponsesInput::Items(items) => items.iter().filter(|item| !item.is_unknown()).cloned().collect(),
-        ResponsesInput::Text(_) => Vec::from(&request.input),
-    };
+    let new_input_items = request.input.clone().into_canonical_items();
 
     // One clone for the unmodified original; `request` is moved as enriched_request.
     let original_request = request.clone();
@@ -223,13 +179,13 @@ async fn rehydrate_request(
     } else if ctx.original_request.previous_response_id.is_some() {
         from_response(&mut ctx, exec_ctx).await?;
     } else {
-        ctx.enriched_request.input = ResponsesInput::Items(Vec::from(&ctx.original_request.input));
+        ctx.enriched_request.input = ResponsesInput::from(Vec::from(&ctx.original_request.input));
     }
 
     exec_ctx
         .gateway_executors
         .validate_declarations(ctx.enriched_request.tool_declarations().as_deref())?;
-    validate_message_content(&ctx.enriched_request.input)?;
+    ctx.enriched_request.input.validate()?;
     validate_multi_agent_request(&ctx.enriched_request)?;
     Ok(ctx)
 }
@@ -299,7 +255,7 @@ async fn from_response(ctx: &mut RequestContext, exec_ctx: &ExecutionContext) ->
     }
 
     ctx.enriched_request.previous_response_id = None;
-    ctx.enriched_request.input = ResponsesInput::Items(items);
+    ctx.enriched_request.input = ResponsesInput::from(items);
     apply_effective_settings(ctx, &stored.metadata);
     Ok(())
 }
@@ -355,7 +311,7 @@ async fn from_session_response(ctx: &mut RequestContext, exec_ctx: &ExecutionCon
         }));
     }
     ctx.enriched_request.previous_response_id = None;
-    ctx.enriched_request.input = ResponsesInput::Items(items);
+    ctx.enriched_request.input = ResponsesInput::from(items);
     ctx.enriched_request.tools = resolve_tools(
         ctx.original_request.tools.as_deref(),
         parent.metadata.effective_tools.as_deref(),
@@ -408,7 +364,7 @@ async fn from_conversation(ctx: &mut RequestContext, exec_ctx: &ExecutionContext
         }));
     }
 
-    ctx.enriched_request.input = ResponsesInput::Items(items);
+    ctx.enriched_request.input = ResponsesInput::from(items);
     ctx.conversation_id = Some(conv_data.conversation_id);
     ctx.conversation_version = Some(snapshot.version);
     Ok(())
@@ -458,7 +414,7 @@ fn restore_agent_tree(ctx: &mut RequestContext, metadata: &ResponseMetadata, max
         .first()
         .filter(|agent| agent.identity.is_root())
         .ok_or_else(|| ExecutorError::InvalidRequest("multi-agent checkpoint has no root".into()))?;
-    ctx.enriched_request.input = ResponsesInput::Items(root.history.clone());
+    ctx.enriched_request.input = ResponsesInput::from(root.history.clone());
     ctx.enriched_request.previous_response_id = None;
     ctx.multi_agent_tree = Some(ValidatedTreeCheckpoint::from_stored(
         tree.clone(),
@@ -476,10 +432,11 @@ mod tests {
     use crate::executor::modes::{ConversationHandler, ResponseHandler};
     use crate::executor::pending_calls::pending_calls;
     use crate::storage::{
-        ConversationStore, ConversationVersion, InOutItem, ResponseMetadata, ResponseStore, create_pool_with_schema,
+        ConversationStore, ConversationVersion, ResponseMetadata, ResponseStore, create_pool_with_schema,
     };
     use crate::types::agent::{AgentIdentity, AgentTurnId};
     use crate::types::agent_tree::{AgentState, StoredAgent, StoredTreeSnapshot};
+    use crate::types::io::InOutItem;
     use crate::types::io::MultiAgentConfig;
     use crate::types::io::output::{McpListTools, OutputItem};
     use crate::types::request_response::{MaxToolCalls, RequestPayload};
@@ -488,7 +445,7 @@ mod tests {
     #[test]
     fn session_history_without_compaction_is_unchanged() {
         let history: Vec<InputItem> = serde_json::from_value(serde_json::json!([
-            {"role":"user", "content":"question"},
+            {"type":"message", "role":"user", "content":"question"},
             {"type":"mcp_list_tools", "id":"mcpl_1", "server_label":"counter", "tools":[]},
             {"type":"function_call", "call_id":"pending", "name":"lookup", "arguments":"{}"}
         ]))
@@ -504,10 +461,10 @@ mod tests {
     fn restored_session_keeps_canonical_compaction_and_mcp_discovery() {
         let history: Vec<InputItem> = serde_json::from_value(serde_json::json!([
             {"type":"mcp_list_tools", "id":"mcpl_1", "server_label":"counter", "tools":[]},
-            {"role":"assistant", "content":"obsolete detail"},
+            {"type":"message", "role":"assistant", "content":"obsolete detail"},
             {"type":"function_call", "call_id":"obsolete", "name":"lookup", "arguments":"{}"},
-            {"role":"user", "content":"noncanonical old user"},
-            {"role":"user", "id":"msg_keep", "status":"completed", "content":"canonical user"},
+            {"type":"message", "role":"user", "content":"noncanonical old user"},
+            {"type":"message", "role":"user", "id":"msg_keep", "status":"completed", "content":"canonical user"},
             {"type":"compaction", "id":"cmp_latest", "encrypted_content":"latest summary"},
             {"type":"function_call", "call_id":"live", "name":"lookup", "arguments":"{}"},
             {"type":"function_call_output", "call_id":"live", "output":"live result"}
@@ -529,11 +486,11 @@ mod tests {
     #[test]
     fn restored_session_uses_the_latest_window_and_preserves_live_pending_calls() {
         let history: Vec<InputItem> = serde_json::from_value(serde_json::json!([
-            {"role":"user", "id":"msg_old", "status":"completed", "content":"old user"},
+            {"type":"message", "role":"user", "id":"msg_old", "status":"completed", "content":"old user"},
             {"type":"mcp_list_tools", "id":"mcpl_old", "server_label":"old", "tools":[]},
             {"type":"compaction", "id":"cmp_old", "encrypted_content":"old summary"},
-            {"role":"user", "id":"msg_keep", "status":"completed", "content":"retained user"},
-            {"role":"user", "id":"msg_incomplete", "status":"in_progress", "content":"superseded"},
+            {"type":"message", "role":"user", "id":"msg_keep", "status":"completed", "content":"retained user"},
+            {"type":"message", "role":"user", "id":"msg_incomplete", "status":"in_progress", "content":"superseded"},
             {"type":"mcp_list_tools", "id":"mcpl_new", "server_label":"new", "tools":[]},
             {"type":"compaction", "id":"cmp_new", "encrypted_content":"latest summary"},
             {"type":"function_call", "call_id":"live", "name":"lookup", "arguments":"{}"}
@@ -565,7 +522,7 @@ mod tests {
 
     #[test]
     fn plaintext_reasoning_is_normalized_for_both_vllm_paths() {
-        let mut input = ResponsesInput::Items(vec![reasoning_item(
+        let mut input = ResponsesInput::from(vec![reasoning_item(
             &["first continuation part", "second continuation part"],
             Some("opaque-provider-state"),
         )]);
@@ -575,7 +532,7 @@ mod tests {
         let ResponsesInput::Items(items) = input else {
             panic!("expected structured input");
         };
-        let InputItem::Reasoning(reasoning) = &items[0] else {
+        let InOutItem::Input(InputItem::Reasoning(reasoning)) = &items[0] else {
             panic!("expected reasoning item");
         };
         assert_eq!(reasoning.id, "rs_prior");
@@ -592,7 +549,7 @@ mod tests {
     #[test]
     fn encrypted_reasoning_requires_nonempty_plaintext_content() {
         for content in [Vec::new(), vec![""], vec!["", ""]] {
-            let mut input = ResponsesInput::Items(vec![reasoning_item(&content, Some("opaque-provider-state"))]);
+            let mut input = ResponsesInput::from(vec![reasoning_item(&content, Some("opaque-provider-state"))]);
 
             let error =
                 prepare_reasoning_for_vllm(&mut input).expect_err("encrypted-only reasoning must not reach vLLM");
@@ -610,14 +567,14 @@ mod tests {
     #[test]
     fn plaintext_reasoning_with_null_encrypted_state_is_normalized_without_summary() {
         let item = reasoning_item(&["plaintext continuation"], None);
-        let mut input = ResponsesInput::Items(vec![item]);
+        let mut input = ResponsesInput::from(vec![item]);
 
         prepare_reasoning_for_vllm(&mut input).expect("null encrypted state is valid");
 
         let ResponsesInput::Items(items) = input else {
             panic!("expected structured input");
         };
-        let InputItem::Reasoning(reasoning) = &items[0] else {
+        let InOutItem::Input(InputItem::Reasoning(reasoning)) = &items[0] else {
             panic!("expected reasoning item");
         };
         assert_eq!(
@@ -653,14 +610,15 @@ mod tests {
     fn validation_failure_does_not_partially_mutate_input() {
         let valid = reasoning_item(&["plaintext continuation"], Some("first-opaque-state"));
         let invalid = reasoning_item(&[], Some("second-opaque-state"));
-        let mut input = ResponsesInput::Items(vec![valid.clone(), invalid]);
+        let mut input = ResponsesInput::from(vec![valid.clone(), invalid]);
 
         prepare_reasoning_for_vllm(&mut input).expect_err("the complete input must validate before normalization");
 
         let ResponsesInput::Items(items) = input else {
             panic!("expected structured input");
         };
-        let (InputItem::Reasoning(actual), InputItem::Reasoning(expected)) = (&items[0], &valid) else {
+        let (InOutItem::Input(InputItem::Reasoning(actual)), InputItem::Reasoning(expected)) = (&items[0], &valid)
+        else {
             panic!("expected reasoning items");
         };
         assert_eq!(actual.content[0].text, expected.content[0].text);
@@ -723,7 +681,7 @@ mod tests {
     #[test]
     fn multi_agent_compaction_trigger_is_allowed() {
         let mut request = request(None, None);
-        request.input = ResponsesInput::Items(vec![InputItem::CompactionTrigger]);
+        request.input = ResponsesInput::from(vec![InputItem::CompactionTrigger]);
         request.multi_agent = serde_json::from_value(serde_json::json!({"enabled":true})).unwrap();
         validate_multi_agent_request(&request).unwrap();
     }
@@ -1017,7 +975,7 @@ mod tests {
             panic!("rehydrated input should contain items");
         };
         assert!(
-            matches!(items.first(), Some(InputItem::McpListTools(list_tools)) if list_tools.server_label == "counter")
+            matches!(items.first(), Some(InOutItem::Input(InputItem::McpListTools(list_tools))) if list_tools.server_label == "counter")
         );
         let ResponsesInput::Items(model_items) = ctx.enriched_request.input.model_input().into_owned() else {
             panic!("model input should contain items");
@@ -1025,7 +983,7 @@ mod tests {
         assert!(
             model_items
                 .iter()
-                .all(|item| !matches!(item, InputItem::McpListTools(_)))
+                .all(|item| !matches!(item, InOutItem::Input(InputItem::McpListTools(_))))
         );
         Ok(())
     }
@@ -1126,7 +1084,7 @@ mod tests {
             .await
             .expect("create response store");
         let response_store = ResponseStore::new(pool);
-        let stored_call: crate::types::io::OutputItem = serde_json::from_value(serde_json::json!({
+        let stored_call: OutputItem = serde_json::from_value(serde_json::json!({
             "type": "tool_search_call",
             "id": "tsc_stored",
             "call_id": "call_search_stored",
@@ -1291,7 +1249,7 @@ mod tests {
             panic!("rehydrated input should contain items");
         };
         assert!(
-            matches!(items.first(), Some(InputItem::McpListTools(list_tools)) if list_tools.server_label == "counter")
+            matches!(items.first(), Some(InOutItem::Input(InputItem::McpListTools(list_tools))) if list_tools.server_label == "counter")
         );
         let ResponsesInput::Items(model_items) = ctx.enriched_request.input.model_input().into_owned() else {
             panic!("model input should contain items");
@@ -1299,7 +1257,7 @@ mod tests {
         assert!(
             model_items
                 .iter()
-                .all(|item| !matches!(item, InputItem::McpListTools(_)))
+                .all(|item| !matches!(item, InOutItem::Input(InputItem::McpListTools(_))))
         );
         Ok(())
     }

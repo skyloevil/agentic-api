@@ -1,6 +1,7 @@
 //! Client shell continuation and public multi-agent lifecycle contracts.
 use super::*;
-use crate::types::io::AgentMessageContent;
+use crate::executor::{prepare_non_generating_turn, rehydrate::rehydrate_conversation};
+use crate::types::io::{AgentMessageContent, InOutItem};
 
 pub(super) fn shell_review_output(request: &Value) -> Option<Vec<Value>> {
     let input = request["input"].as_array().unwrap();
@@ -120,7 +121,23 @@ async fn child_shell_call_survives_checkpoint_and_client_continuation() {
                 .unwrap(),
                 ..Default::default()
             };
-            // Both continuations restore the original pending shell ownership.
+            // Output-only history cannot be silently discarded during continuation validation.
+            for item in [
+                json!({"type":"web_search_call", "id":"ws_1", "status":"completed",
+                    "action":{"type":"search", "query":"weather"}}),
+                json!({"type":"mcp_call", "id":"mcp_1", "name":"weather",
+                    "server_label":"weather", "arguments":"{}", "output":"sunny", "status":"completed"}),
+            ] {
+                let mut invalid = continuation.clone();
+                invalid.input.push(serde_json::from_value::<InOutItem>(item).unwrap());
+                let ctx = rehydrate_conversation(invalid, &exec).await.unwrap();
+                assert!(matches!(
+                    prepare_non_generating_turn(ctx, &exec),
+                    Err(ExecutorError::InvalidRequest(message))
+                        if message.contains("multi-agent continuation accepts")
+                ));
+            }
+            // Rejected attempts must leave the original pending shell ownership intact.
             for request in [continuation.clone(), continuation] {
                 let completed = response(request, exec.clone()).await;
                 assert_eq!(completed.status, "completed");

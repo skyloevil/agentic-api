@@ -1,4 +1,6 @@
 //! Typed client events and steering outcomes for Responses WebSocket sessions.
+use crate::types::io::InOutItem;
+
 use serde::{Deserialize, Serialize};
 
 use super::client_calls::ClientCallId;
@@ -79,7 +81,7 @@ impl TryFrom<ResponsesInput> for SteeringInput {
                 return Err(SteeringInputError::EmptyMessages);
             }
             for item in items {
-                let InputItem::Message(message) = item else {
+                let InOutItem::Input(InputItem::Message(message)) = item else {
                     return Err(SteeringInputError::InvalidMessage);
                 };
                 if message.role != "user"
@@ -343,14 +345,14 @@ mod tests {
                 role: role.to_owned(),
                 ..InputMessage::default()
             };
-            assert!(SteeringInput::try_from(ResponsesInput::Items(vec![InputItem::Message(message)])).is_err());
+            assert!(SteeringInput::try_from(ResponsesInput::from(vec![InputItem::Message(message)])).is_err());
         }
         let message = InputMessage {
             role: "user".to_owned(),
             content: InputMessageContent::Parts(vec![InputContent::OutputText(InputTextContent::new("no"))]),
             ..InputMessage::default()
         };
-        assert!(SteeringInput::try_from(ResponsesInput::Items(vec![InputItem::Message(message)])).is_err());
+        assert!(SteeringInput::try_from(ResponsesInput::from(vec![InputItem::Message(message)])).is_err());
         let mut image = InputImageContent {
             image_url: Some("https://example.com/image.png".to_owned()),
             ..InputImageContent::default()
@@ -361,7 +363,7 @@ mod tests {
             content: InputMessageContent::Parts(vec![InputContent::InputImage(image)]),
             ..InputMessage::default()
         };
-        assert!(SteeringInput::try_from(ResponsesInput::Items(vec![InputItem::Message(message)])).is_err());
+        assert!(SteeringInput::try_from(ResponsesInput::from(vec![InputItem::Message(message)])).is_err());
         let input: SteeringInput = serde_json::from_value(json!([
             {"role":"user","content":"first"}, {"role":"user","content":[{"type":"input_text","text":"second"}]}
         ]))

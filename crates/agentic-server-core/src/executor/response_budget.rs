@@ -529,7 +529,7 @@ mod tests {
     use crate::utils::common::deserialize_from_value;
 
     fn steering_message(content: InputMessageContent) -> SteeringInput {
-        SteeringInput::try_from(ResponsesInput::Items(vec![InputItem::Message(InputMessage {
+        SteeringInput::try_from(ResponsesInput::from(vec![InputItem::Message(InputMessage {
             role: "user".to_owned(),
             content,
             ..InputMessage::default()
@@ -608,8 +608,8 @@ mod tests {
             content: InputMessageContent::Text(String::new()),
             ..InputMessage::default()
         });
-        let one = SteeringInput::try_from(ResponsesInput::Items(vec![message.clone()])).unwrap();
-        let many = SteeringInput::try_from(ResponsesInput::Items(vec![message; 128])).unwrap();
+        let one = SteeringInput::try_from(ResponsesInput::from(vec![message.clone()])).unwrap();
+        let many = SteeringInput::try_from(ResponsesInput::from(vec![message; 128])).unwrap();
         assert!(one.retained_bytes() > RETAINED_CONTAINER_OVERHEAD_BYTES);
         assert!(many.retained_bytes() - one.retained_bytes() >= 127 * RETAINED_CONTAINER_OVERHEAD_BYTES);
 

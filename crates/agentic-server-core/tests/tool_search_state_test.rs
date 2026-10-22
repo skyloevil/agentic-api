@@ -1,4 +1,5 @@
 use agentic_core::tool::{ToolSearchHandler, ToolSearchState, model_visible_namespace_member_name};
+use agentic_core::types::io::InOutItem;
 use agentic_core::{InputItem, RequestPayload, ResponsesInput};
 use serde_json::{Value, json};
 
@@ -373,7 +374,7 @@ fn invalid_history_order_and_linkage_are_rejected() {
     let ResponsesInput::Items(items) = &mut blank_call.input else {
         panic!("test request uses item input")
     };
-    let InputItem::ToolSearchCall(call) = &mut items[0] else {
+    let InOutItem::Input(InputItem::ToolSearchCall(call)) = &mut items[0] else {
         panic!("test request starts with search call")
     };
     call.call_id.clear();
@@ -384,7 +385,7 @@ fn invalid_history_order_and_linkage_are_rejected() {
     let ResponsesInput::Items(items) = &mut blank_output.input else {
         panic!("test request uses item input")
     };
-    let InputItem::ToolSearchOutput(output) = &mut items[1] else {
+    let InOutItem::Input(InputItem::ToolSearchOutput(output)) = &mut items[1] else {
         panic!("test request ends with search output")
     };
     output.call_id.clear();

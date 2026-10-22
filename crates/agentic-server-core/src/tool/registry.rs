@@ -22,7 +22,7 @@ use super::web_search::insert_web_search_entry;
 use super::{CodexNamespaceHandler, McpHandler, NamespaceMap, ToolError, ToolOutput};
 
 use crate::types::io::output::{FunctionToolCall, McpListTools};
-use crate::types::io::{InputItem, ResponsesInput};
+use crate::types::io::{InOutItem, InputItem, ResponsesInput};
 use crate::types::tools::{CodeInterpreterToolParam, FileSearchToolParam, WebFetchToolParam};
 
 const MAX_MCP_SERVERS_PER_REQUEST: usize = 64;
@@ -452,8 +452,8 @@ impl ToolRegistry {
 
     pub(crate) fn cache_listed_mcp_tools(&mut self, input: &ResponsesInput) {
         if let ResponsesInput::Items(items) = input {
-            for item in items {
-                let InputItem::McpListTools(list_tools) = item else {
+            for item in items.iter().filter_map(InOutItem::as_input) {
+                let InputItem::McpListTools(list_tools) = &*item else {
                     continue;
                 };
                 // Only a currently declared MCP server can emit discovery in
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn ignores_mcp_list_history_for_servers_absent_from_current_registry() {
         let mut registry = ToolRegistry::default();
-        let input = ResponsesInput::Items(vec![
+        let input = ResponsesInput::from(vec![
             InputItem::McpListTools(McpListTools::new("mcpl_1", "counter", Vec::new())),
             InputItem::McpListTools(McpListTools::new("mcpl_2", "search", Vec::new())),
         ]);

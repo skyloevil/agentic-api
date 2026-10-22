@@ -478,7 +478,7 @@ async fn concurrent_children_pause_and_resume_from_durable_tree_json_and_sse() {
                 store: true,
                 stream,
                 previous_response_id: Some(first.id.clone()),
-                input: ResponsesInput::Items(
+                input: ResponsesInput::from(
                     calls
                         .iter()
                         .map(|call| {
@@ -487,7 +487,7 @@ async fn concurrent_children_pause_and_resume_from_durable_tree_json_and_sse() {
                                 output: ToolCallOutput::Text("proposal details".into()),
                             })
                         })
-                        .collect(),
+                        .collect::<Vec<_>>(),
                 ),
                 ..Default::default()
             };
@@ -509,7 +509,7 @@ async fn concurrent_children_pause_and_resume_from_durable_tree_json_and_sse() {
 #[test]
 fn forks_do_not_duplicate_pending_parent_calls() {
     let history: Vec<InputItem> = serde_json::from_value(json!([
-        {"role":"user","content":"context"},
+        {"type":"message","role":"user","content":"context"},
         {"type":"function_call","call_id":"open","name":"get_proposal","arguments":"{}"},
         {"type":"function_call","call_id":"closed","name":"get_proposal","arguments":"{}"},
         {"type":"function_call_output","call_id":"closed","output":"value"},

@@ -1,6 +1,8 @@
 //! Deterministic core execution tests, not recordings of WebSocket behavior.
 #![cfg(test)]
 
+use crate::types::io::InOutItem;
+
 use super::*;
 use crate::executor::multi_agent::{
     AgentPhase, RunControl,
@@ -635,7 +637,7 @@ async fn async_output_accepted_during_the_roots_final_round_is_read_next() {
     };
     let copies = sent
         .iter()
-        .filter(|item| matches!(item, InputItem::FunctionCallOutput(output) if output.call_id == "async_call"))
+        .filter(|item| matches!(item, InOutItem::Input(InputItem::FunctionCallOutput(output)) if output.call_id == "async_call"))
         .count();
     assert_eq!(copies, 1, "the next upstream input carries the output once");
     assert_eq!(

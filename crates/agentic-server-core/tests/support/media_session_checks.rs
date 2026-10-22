@@ -190,7 +190,7 @@ async fn combined_media_message_file_rejection_precedes_compaction_and_releases_
         .await
         .err()
         .expect("unsupported message file");
-    assert!(matches!(error, ExecutorError::InvalidRequest(_)));
+    assert!(matches!(error, ExecutorError::InvalidInput(_)));
     assert!(error.to_string().contains("input_file"), "{error}");
     assert!(
         model.requests.lock().await.is_empty(),

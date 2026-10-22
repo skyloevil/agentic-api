@@ -2,6 +2,8 @@
 //! opens its `agentic.execute` span, and hands off to the blocking or
 //! streaming driver.
 
+#[cfg(test)]
+use crate::types::io::InOutItem;
 use std::sync::Arc;
 
 use either::Either;
@@ -171,7 +173,7 @@ impl ExecuteRequest {
             items.extend(input.as_ref().clone().into_canonical_items());
         }
         items.extend(std::mem::take(&mut self.payload.input).into_canonical_items());
-        self.payload.input = ResponsesInput::Items(items);
+        self.payload.input = ResponsesInput::from(items);
         // Generated IDs are fixed-size and the admitted entry count is bounded.
         // Do not copy descriptors' repeated parent IDs or serialize input again.
         self.steering_ids = queue.entries().map(|(steer, _)| steer.id.clone()).collect();
@@ -558,18 +560,22 @@ mod tests {
             panic!("items")
         };
         assert_eq!(items.len(), 6);
-        assert!(matches!(&items[0], InputItem::Message(message)
+        assert!(matches!(&items[0], InOutItem::Input(InputItem::Message(message))
             if matches!(&message.content, InputMessageContent::Text(text) if text.is_empty())));
-        assert!(matches!(&items[1], InputItem::Message(message)
+        assert!(matches!(&items[1], InOutItem::Input(InputItem::Message(message))
             if matches!(&message.content, InputMessageContent::Parts(parts) if parts.len() == 2)));
-        assert!(matches!(&items[2], InputItem::Message(message)
+        assert!(matches!(&items[2], InOutItem::Input(InputItem::Message(message))
             if matches!(&message.content, InputMessageContent::Text(text) if text == "SECOND_UPDATE")));
-        assert!(matches!(&items[3], InputItem::FunctionCallOutput(output) if output.call_id == "weather"));
-        assert!(matches!(&items[4], InputItem::CustomToolCallOutput(output) if output.call_id == "notes"));
-        assert!(matches!(&items[5], InputItem::Message(message)
+        assert!(
+            matches!(&items[3], InOutItem::Input(InputItem::FunctionCallOutput(output)) if output.call_id == "weather")
+        );
+        assert!(
+            matches!(&items[4], InOutItem::Input(InputItem::CustomToolCallOutput(output)) if output.call_id == "notes")
+        );
+        assert!(matches!(&items[5], InOutItem::Input(InputItem::Message(message))
             if matches!(&message.content, InputMessageContent::Text(text) if text == "EXPLICIT_INPUT")));
         assert!(
-            matches!(&prepared.ctx.as_ref().unwrap().new_input_items[4], InputItem::CustomToolCallOutput(output)
+            matches!(&prepared.ctx.as_ref().unwrap().new_input_items[4], InOutItem::Input(InputItem::CustomToolCallOutput(output))
             if output.call_id == "notes")
         );
         assert!(!prepared.matches_steering(&steering_queue(pin.response_id())));
@@ -935,11 +941,13 @@ mod tests {
                 panic!("preparation must combine parent history and successor input");
             };
             assert_eq!(items.len(), 4);
-            assert!(matches!(&items[0], InputItem::Message(message)
+            assert!(matches!(&items[0], InOutItem::Input(InputItem::Message(message))
                 if matches!(&message.content, InputMessageContent::Text(text) if text == "parent prompt")));
-            assert!(matches!(&items[1], InputItem::FunctionCall(call) if call.call_id == "weather"));
-            assert!(matches!(&items[2], InputItem::FunctionCallOutput(output) if output.call_id == "weather"));
-            assert!(matches!(&items[3], InputItem::Message(message)
+            assert!(matches!(&items[1], InOutItem::Input(InputItem::FunctionCall(call)) if call.call_id == "weather"));
+            assert!(
+                matches!(&items[2], InOutItem::Input(InputItem::FunctionCallOutput(output)) if output.call_id == "weather")
+            );
+            assert!(matches!(&items[3], InOutItem::Input(InputItem::Message(message))
                 if matches!(&message.content, InputMessageContent::Text(text) if text == "successor input")));
             drop(ctx);
         }

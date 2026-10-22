@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use agentic_core::executor::request::RequestContext;
 use agentic_core::executor::{ExecuteRequest, UpstreamBody, decode_upstream};
-use agentic_core::storage::InOutItem;
+use agentic_core::types::io::InOutItem;
 use agentic_core::types::io::{InputItem, OutputItem, ResponsesInput, ShellCall, ShellCallStatus};
 use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
 use either::Either;
@@ -89,7 +89,7 @@ fn prepared_shell_history_and_choice_match_upstream_function_tools() {
     let mut request = request(false);
     request.input = serde_json::from_value(json!([shell_item("completed"), shell_output()])).unwrap();
     let mut prepared = request.clone();
-    prepared.input = ResponsesInput::Items(Vec::from(&request.input));
+    prepared.input = ResponsesInput::from(Vec::from(&request.input));
     let upstream = serde_json::to_value(prepared.to_upstream_request(false).unwrap()).unwrap();
     assert_eq!(upstream["tool_choice"], json!({"type": "function", "name": "shell"}));
     assert_eq!(upstream["tools"][0]["name"], "shell");

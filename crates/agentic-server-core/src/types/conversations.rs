@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::event::MessageStatus;
 use super::io::{InputContent, InputMessageContent, InputTextContent};
 use serde_json::Value;
 
-use super::io::{InputItem, OutputItem};
+use super::io::{InOutItem, InputItem};
 
 /// String metadata attached to a conversation.
 pub type ConversationMetadata = BTreeMap<String, String>;
@@ -23,7 +23,7 @@ pub struct CreateConversationRequest {
 
     /// Optional initial items to add to the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<ConversationItem>>,
+    pub items: Option<Vec<InOutItem>>,
 }
 
 /// Request to update a conversation's metadata.
@@ -57,7 +57,7 @@ pub struct ConversationResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CreateItemRequest {
     /// Items to append in the supplied order.
-    pub items: Vec<ConversationItem>,
+    pub items: Vec<InOutItem>,
 }
 
 /// Response for listing items with pagination.
@@ -84,7 +84,7 @@ pub struct ListItemsResponse {
 #[derive(Debug, Clone)]
 pub struct ItemResponse {
     pub id: String,
-    pub item: ConversationItem,
+    pub item: InOutItem,
 }
 
 #[cfg(feature = "openapi")]
@@ -98,7 +98,7 @@ impl utoipa::PartialSchema for ItemResponse {
                     .property("id", ObjectBuilder::new().schema_type(Type::String))
                     .required("id"),
             )
-            .item(Ref::from_schema_name("ConversationItem"))
+            .item(Ref::from_schema_name("InOutItem"))
             .into()
     }
 }
@@ -116,32 +116,6 @@ impl Serialize for ItemResponse {
         // must use the same ID as its retrieval URL and pagination cursor, once.
         object.insert("id".to_owned(), Value::String(self.id.clone()));
         value.serialize(serializer)
-    }
-}
-
-/// A supported conversation input or output item.
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub enum ConversationItem {
-    Input(InputItem),
-    Output(OutputItem),
-}
-
-impl<'de> Deserialize<'de> for ConversationItem {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        let input = InputItem::deserialize(&value).map_err(serde::de::Error::custom)?;
-        if !matches!(input, InputItem::Unknown) {
-            return Ok(Self::Input(input));
-        }
-        // InputItem's forward-compatible fallback must not consume output-only
-        // kinds such as web_search_call and mcp_call and discard their payloads.
-        let output = OutputItem::deserialize(value).map_err(serde::de::Error::custom)?;
-        if matches!(output, OutputItem::Unknown) {
-            return Err(serde::de::Error::custom("unsupported conversation item type"));
-        }
-        Ok(Self::Output(output))
     }
 }
 
@@ -185,8 +159,8 @@ impl ConversationResponse {
 impl ItemResponse {
     /// Build the public resource, expanding shorthand message content.
     #[must_use]
-    pub fn new(id: String, mut item: ConversationItem) -> Self {
-        if let ConversationItem::Input(InputItem::Message(message)) = &mut item {
+    pub fn new(id: String, mut item: InOutItem) -> Self {
+        if let InOutItem::Input(InputItem::Message(message)) = &mut item {
             message.status.get_or_insert(MessageStatus::Completed);
             if let InputMessageContent::Text(text) = &mut message.content {
                 let content = InputTextContent::new(std::mem::take(text));

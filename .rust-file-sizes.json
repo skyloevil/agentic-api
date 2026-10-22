@@ -2,24 +2,20 @@
   "version": 1,
   "baseline": {
     "crates/agentic-server-core/src/tool/registry.rs": 515,
-    "crates/agentic-server-core/src/tool/tool_search.rs": 1661,
+    "crates/agentic-server-core/src/tool/tool_search.rs": 1660,
     "crates/agentic-server-core/src/types/io/output.rs": 1074,
     "crates/agentic-server-core/src/types/tools/params.rs": 537,
     "crates/agentic-server/src/agentic_process.rs": 557,
-    "crates/agentic-server/src/auth.rs": 791
+    "crates/agentic-server/src/auth.rs": 727
   },
   "exceptions": {
     "crates/agentic-server-core/src/config.rs": {
-      "limit": 643,
-      "reason": "The gateway-executed web_fetch settings join the shared tool runtime configuration beside the web-search provider and code-interpreter limits, and the web_search provider enum now also selects SearXNG."
+      "limit": 648,
+      "reason": "The gateway-executed web_fetch settings join the shared tool runtime configuration beside the web-search provider and code-interpreter limits, and the web_search provider enum now also selects SearXNG and Serply."
     },
     "crates/agentic-server-core/src/tool/registry.rs": {
       "limit": 567,
       "reason": "The web_fetch executor binds through the existing registry validation and executor registration flow, like the code interpreter; async client tools record their marker on the shared catalog entry."
-    },
-    "crates/agentic-server-core/src/tool/tool_search.rs": {
-      "limit": 1681,
-      "reason": "Code-interpreter continuation items pass through tool-search history without changing discovery state."
     },
     "crates/agentic-server-core/src/types/io/output.rs": {
       "limit": 1120,
@@ -32,6 +28,10 @@
     "crates/agentic-server/src/main.rs": {
       "limit": 644,
       "reason": "Server configuration resolves the web_fetch settings with the same file and environment precedence as the other tool settings."
+    },
+    "crates/agentic-server-core/src/storage/models/item.rs": {
+      "limit": 510,
+      "reason": "The item CRUD now owns response-history row identity, as requested in review; consolidating the insert here adds the row/public-ID bookkeeping. Splitting the item storage module is a separate change."
     }
   },
   "generated": {}

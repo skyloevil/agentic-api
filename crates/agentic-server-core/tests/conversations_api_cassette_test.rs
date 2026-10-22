@@ -1,5 +1,7 @@
-//! Compare recorder-generated `OpenAI` and gateway item API histories.
+//! Compare recorded API histories and replay them through the current gateway.
 //! Set `REQUIRE_CONVERSATIONS_CASSETTES=1` in CI to require both recordings.
+
+mod support;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -646,7 +648,7 @@ fn check_pagination(cassette: &Cassette, streaming: bool) {
     );
 }
 
-fn compare_case(scenario: &str) {
+async fn compare_case(scenario: &str) {
     for streaming in [false, true] {
         let name = if streaming {
             format!("{scenario}-stream")
@@ -662,28 +664,33 @@ fn compare_case(scenario: &str) {
             check_case(&gateway, scenario, streaming);
         }
         compare_recordings(&name, &openai, &gateway);
+        replay::run(&format!("{name}/openai"), &openai).await;
+        replay::run(&format!("{name}/gateway"), &gateway).await;
     }
 }
 
-#[test]
-fn continuation_matches_openai() {
-    compare_case("continuation");
+#[tokio::test]
+async fn continuation_matches_openai() {
+    compare_case("continuation").await;
 }
 
-#[test]
-fn deletion_matches_openai() {
-    compare_case("deletion");
+#[tokio::test]
+async fn deletion_matches_openai() {
+    compare_case("deletion").await;
 }
 
-#[test]
-fn response_branch_matches_openai() {
-    compare_case("branch");
+#[tokio::test]
+async fn response_branch_matches_openai() {
+    compare_case("branch").await;
 }
 
-#[test]
-fn pagination_matches_openai() {
-    compare_case("pagination");
+#[tokio::test]
+async fn pagination_matches_openai() {
+    compare_case("pagination").await;
 }
+
+#[path = "conversations/replay.rs"]
+mod replay;
 
 fn check_edge_case_recording(cassette: &Cassette) {
     let turns = &cassette.turns;
@@ -888,8 +895,9 @@ fn check_reused_item_occurrences(recording: &Cassette) {
 #[tokio::test]
 async fn existing_conversation_item_error_matches_openai_recording() {
     use agentic_core::executor::ExecutorError;
-    use agentic_core::storage::{ConversationStore, InOutItem, create_pool_with_schema};
+    use agentic_core::storage::{ConversationStore, create_pool_with_schema};
     use agentic_core::types::conversations::CreateItemRequest;
+    use agentic_core::types::io::InOutItem;
 
     let reference = cassette("edge-cases", "openai").expect("OpenAI edge-case recording");
     let pool = create_pool_with_schema(Some("sqlite::memory:")).await.unwrap();
@@ -902,16 +910,8 @@ async fn existing_conversation_item_error_matches_openai_recording() {
         .unwrap();
     let before = store.rehydrate_snapshot(&conversation.conversation_id).await.unwrap();
     let request: CreateItemRequest = serde_json::from_value(reference.turns[17].request.body.clone()).unwrap();
-    let items = request
-        .items
-        .into_iter()
-        .map(|item| match item {
-            agentic_core::types::conversations::ConversationItem::Input(item) => InOutItem::Input(item),
-            agentic_core::types::conversations::ConversationItem::Output(item) => InOutItem::Output(item),
-        })
-        .collect();
     let error: ExecutorError = store
-        .create_items("default_tenant", &conversation.conversation_id, items)
+        .create_items("default_tenant", &conversation.conversation_id, request.items)
         .await
         .unwrap_err()
         .into();
@@ -926,8 +926,9 @@ async fn existing_conversation_item_error_matches_openai_recording() {
 #[tokio::test]
 async fn deleted_cursor_error_body_matches_openai_recording() {
     use agentic_core::executor::ExecutorError;
-    use agentic_core::storage::{ConversationStore, InOutItem, create_pool_with_schema};
+    use agentic_core::storage::{ConversationStore, create_pool_with_schema};
     use agentic_core::types::conversations::ItemOrder;
+    use agentic_core::types::io::InOutItem;
 
     let reference = cassette("edge-cases", "openai").expect("OpenAI edge-case recording");
     let pool = create_pool_with_schema(Some("sqlite::memory:")).await.unwrap();

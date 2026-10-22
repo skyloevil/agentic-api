@@ -15,7 +15,6 @@ use tracing::{Instrument as _, debug};
 
 use crate::executor::compaction::maybe_compact_context;
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::gateway::history::append_input_item;
 use crate::executor::gateway::{
     BuiltInToolCallBudget, GatewayCallResult, GatewayScheduler, append_gateway_calls_to_new_input,
     append_output_items_to_input, append_tool_outputs, emit_gateway_start_events, execute_and_emit_output_calls,
@@ -119,7 +118,8 @@ fn record_round_history(
             output_items
                 .iter()
                 .filter(|item| !matches!(item, OutputItem::McpListTools(_)))
-                .filter_map(OutputItem::to_input_item),
+                .filter_map(OutputItem::to_input_item)
+                .map(Into::into),
         );
         continuation.mark_outputs_recorded(public_output_count);
     } else {
@@ -406,7 +406,7 @@ impl<'a> AgentTurn<'a> {
                     item => item.to_input_item(),
                 };
                 if let Some(input) = input {
-                    append_input_item(&mut self.pipeline.request.enriched_request.input, input);
+                    self.pipeline.request.enriched_request.input.push(input);
                 }
             }
         } else {

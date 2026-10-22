@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use agentic_core::config::{PostgresConfig, SqliteConfig};
-use agentic_core::storage::{ConversationStore, InOutItem, create_pool_with_schema_and_configs};
+use agentic_core::storage::{ConversationStore, create_pool_with_schema_and_configs};
+use agentic_core::types::io::InOutItem;
 use agentic_core::types::io::{InputItem, InputMessage, InputMessageContent};
 use serde_json::json;
 

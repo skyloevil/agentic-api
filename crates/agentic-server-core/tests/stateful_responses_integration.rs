@@ -9,7 +9,7 @@ use agentic_core::executor::request::RequestContext;
 use agentic_core::executor::{
     ExecutionContext, ExecutorError, execute, persist_response, persist_turn, rehydrate_conversation,
 };
-use agentic_core::storage::InOutItem;
+use agentic_core::types::io::InOutItem;
 use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
 use agentic_core::types::tools::{FunctionToolParam, NonEmptyToolName};
 use agentic_core::{
@@ -430,7 +430,7 @@ async fn test_previous_response_id_rehydrates_function_call_before_tool_output()
     let p1 = unwrap_blocking(execute(first, Arc::clone(&fixture.exec_ctx)).await.expect("first turn"));
 
     let mut second = make_request("ignored", true, false, Some(p1.id), None);
-    second.input = ResponsesInput::Items(vec![InputItem::FunctionCallOutput(FunctionToolResultMessage {
+    second.input = ResponsesInput::from(vec![InputItem::FunctionCallOutput(FunctionToolResultMessage {
         call_id: "call_1".to_string(),
         output: "{\"stdout\":\"/workspace\"}".into(),
     })]);
@@ -492,7 +492,7 @@ async fn test_encrypted_only_persisted_reasoning_fails_before_upstream() {
 
     for stream in [false, true] {
         let mut continuation = make_request("continue", true, stream, Some(first.id.clone()), None);
-        continuation.input = ResponsesInput::Items(vec![InputItem::FunctionCallOutput(FunctionToolResultMessage {
+        continuation.input = ResponsesInput::from(vec![InputItem::FunctionCallOutput(FunctionToolResultMessage {
             call_id: "call_prior".to_owned(),
             output: "tool output".into(),
         })]);
@@ -556,7 +556,7 @@ async fn test_mcp_namespace_showcase_round_trip_rehydrates_calls_tools_and_outpu
     );
 
     let mut second = make_request("ignored", true, false, Some(p1.id), None);
-    second.input = ResponsesInput::Items(vec![
+    second.input = ResponsesInput::from(vec![
         tool_output(
             "call_echo",
             r#"{"echo":"NAMESPACE SHOWCASE","characters":18,"words":2}"#,

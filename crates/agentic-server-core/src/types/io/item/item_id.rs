@@ -1,6 +1,6 @@
 //! Typed public item identities and their known type-specific prefixes.
 
-use super::{InputItem, OutputItem};
+use crate::types::io::{InputItem, OutputItem};
 
 impl InputItem {
     /// Returns the public ID carried by this input item, when present.
@@ -20,11 +20,12 @@ impl InputItem {
             Self::Reasoning(item) => Some(&item.id),
             Self::McpListTools(item) => Some(&item.id),
             Self::Compaction(item) => item.id.as_deref(),
+            Self::WebSearchCall(item) => Some(&item.id),
+            Self::McpCall(item) => Some(&item.id),
             Self::FunctionCallOutput(_)
             | Self::ToolSearchOutput(_)
             | Self::CustomToolCallOutput(_)
-            | Self::CompactionTrigger
-            | Self::Unknown => None,
+            | Self::CompactionTrigger => None,
         }
     }
 
@@ -45,12 +46,13 @@ impl InputItem {
             Self::Reasoning(_) => Some("rs_"),
             Self::McpListTools(_) => Some("mcpl_"),
             Self::Compaction(_) => Some("cmp_"),
+            Self::WebSearchCall(_) => Some("ws_"),
+            Self::McpCall(_) => Some("mcp_"),
             Self::ShellCallOutput(_)
             | Self::FunctionCallOutput(_)
             | Self::ToolSearchOutput(_)
             | Self::CustomToolCallOutput(_)
-            | Self::CompactionTrigger
-            | Self::Unknown => None,
+            | Self::CompactionTrigger => None,
         }
     }
 }

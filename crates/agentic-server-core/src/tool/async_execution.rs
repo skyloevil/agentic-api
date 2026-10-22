@@ -13,6 +13,8 @@
 //! returned to the client. The public `async` marker itself is not sent upstream: declarations lose
 //! it during normalization and replayed calls lose it in [`lower_async_calls`].
 
+use crate::types::io::InOutItem;
+
 use std::borrow::Cow;
 use std::collections::HashSet;
 
@@ -71,14 +73,14 @@ pub fn lower_async_calls(input: Cow<'_, ResponsesInput>) -> Cow<'_, ResponsesInp
     };
     if !items
         .iter()
-        .any(|item| matches!(item, InputItem::FunctionCall(call) if call.async_execution))
+        .any(|item| matches!(item, InOutItem::Input(InputItem::FunctionCall(call)) if call.async_execution))
     {
         return input;
     }
     let answered: HashSet<&str> = items
         .iter()
         .filter_map(|item| match item {
-            InputItem::FunctionCallOutput(output) => Some(output.call_id.as_str()),
+            InOutItem::Input(InputItem::FunctionCallOutput(output)) => Some(output.call_id.as_str()),
             _ => None,
         })
         .collect();
@@ -86,7 +88,9 @@ pub fn lower_async_calls(input: Cow<'_, ResponsesInput>) -> Cow<'_, ResponsesInp
     let notes: Vec<Option<String>> = items
         .iter()
         .map(|item| match item {
-            InputItem::FunctionCall(call) if call.async_execution && !answered.contains(call.call_id.as_str()) => {
+            InOutItem::Input(InputItem::FunctionCall(call))
+                if call.async_execution && !answered.contains(call.call_id.as_str()) =>
+            {
                 Some(pending_call_note(&call.name, &call.call_id))
             }
             _ => None,
@@ -100,27 +104,27 @@ pub fn lower_async_calls(input: Cow<'_, ResponsesInput>) -> Cow<'_, ResponsesInp
     let mut lowered = Vec::with_capacity(items.len() + 1);
     let mut pending = Vec::new();
     for (item, note) in items.into_iter().zip(notes) {
-        let InputItem::FunctionCall(mut call) = item else {
+        let InOutItem::Input(InputItem::FunctionCall(mut call)) = item else {
             // Outputs directly after the calls stay with them: chat templates expect tool call
             // outputs to follow the assistant's tool calls.
-            if !matches!(item, InputItem::FunctionCallOutput(_)) {
+            if !matches!(item, InOutItem::Input(InputItem::FunctionCallOutput(_))) {
                 lowered.append(&mut pending);
             }
             lowered.push(item);
             continue;
         };
         if let Some(note) = note {
-            pending.push(InputItem::Message(InputMessage {
+            pending.push(InOutItem::Input(InputItem::Message(InputMessage {
                 role: "developer".into(),
                 content: InputMessageContent::Text(note),
                 ..Default::default()
-            }));
+            })));
         }
         call.async_execution = false;
-        lowered.push(InputItem::FunctionCall(call));
+        lowered.push(InOutItem::Input(InputItem::FunctionCall(call)));
     }
     lowered.append(&mut pending);
-    Cow::Owned(ResponsesInput::Items(lowered))
+    Cow::Owned(ResponsesInput::from(lowered))
 }
 
 #[cfg(test)]
@@ -170,12 +174,12 @@ mod tests {
         items
             .iter()
             .map(|item| match item {
-                InputItem::FunctionCall(call) => {
+                InOutItem::Input(InputItem::FunctionCall(call)) => {
                     assert!(!call.async_execution, "the marker is not sent upstream");
                     format!("call:{}", call.call_id)
                 }
-                InputItem::FunctionCallOutput(output) => format!("output:{}", output.call_id),
-                InputItem::Message(message) if message.role == "developer" => {
+                InOutItem::Input(InputItem::FunctionCallOutput(output)) => format!("output:{}", output.call_id),
+                InOutItem::Input(InputItem::Message(message)) if message.role == "developer" => {
                     let InputMessageContent::Text(text) = &message.content else {
                         panic!("text note");
                     };
@@ -187,7 +191,7 @@ mod tests {
                     assert_eq!(text, &pending_call_note("get_weather", call_id));
                     format!("note:{call_id}")
                 }
-                InputItem::Message(_) => "user".to_owned(),
+                InOutItem::Input(InputItem::Message(_)) => "user".to_owned(),
                 other => panic!("unexpected item {other:?}"),
             })
             .collect()
@@ -228,14 +232,14 @@ mod tests {
 
     #[test]
     fn input_without_async_calls_is_borrowed_unchanged() {
-        let input = ResponsesInput::Items(vec![user("hi"), call("call_sync", false)]);
+        let input = ResponsesInput::from(vec![user("hi"), call("call_sync", false)]);
         assert!(matches!(lower_async_calls(Cow::Borrowed(&input)), Cow::Borrowed(_)));
     }
 
     /// A note never separates a call run from the outputs that directly follow it.
     #[test]
     fn notes_follow_the_outputs_of_their_call_run() {
-        let input = ResponsesInput::Items(vec![
+        let input = ResponsesInput::from(vec![
             user("start"),
             call("call_async", true),
             call("call_sync", false),
@@ -258,7 +262,7 @@ mod tests {
 
     #[test]
     fn notes_follow_the_call_run_and_only_for_pending_async_calls() {
-        let input = ResponsesInput::Items(vec![
+        let input = ResponsesInput::from(vec![
             user("start"),
             call("call_a", true),
             call("call_b", false),

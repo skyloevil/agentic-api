@@ -9,7 +9,7 @@ fn trigger(previous: Option<&str>, stream: bool) -> RequestPayload {
         store: true,
         stream,
         previous_response_id: previous.map(str::to_owned),
-        input: ResponsesInput::Items(vec![InputItem::CompactionTrigger]),
+        input: ResponsesInput::from(vec![InputItem::CompactionTrigger]),
         ..Default::default()
     }
 }

@@ -1,3 +1,5 @@
+use crate::types::io::InOutItem;
+use std::borrow::Cow;
 use std::{collections::HashSet, num::NonZeroUsize};
 
 use super::super::agent_turn::AgentTurn;
@@ -52,16 +54,13 @@ pub(in crate::executor::engine) fn prepare_without_inference(
     settings.input = ResponsesInput::Items(Vec::new());
     for agent in &mut restored.agents {
         let mut effective = settings.clone();
-        effective.input = ResponsesInput::Items(std::mem::take(&mut agent.history));
+        effective.input = ResponsesInput::from(std::mem::take(&mut agent.history));
         let search = ToolSearchHandler::prepare_request(
             &mut effective,
             &agent.loaded_tools,
             request.original_request.tools.is_some(),
         )?;
-        agent.history = match effective.input {
-            ResponsesInput::Items(history) => history,
-            input @ ResponsesInput::Text(_) => Vec::from(&input),
-        };
+        agent.history = effective.input.input_items().map(Cow::into_owned).collect();
         if let Some(search) = search {
             agent.loaded_tools = search.into_public_metadata().loaded_tools;
         }
@@ -80,16 +79,27 @@ pub(in crate::executor::engine) fn prepare_without_inference(
 }
 
 impl RestoredAgents {
-    pub(super) fn continue_input(&mut self, response_id: &str, input: &[InputItem]) -> ExecutorResult<()> {
+    pub(super) fn continue_input(&mut self, response_id: &str, input: &[InOutItem]) -> ExecutorResult<()> {
         let mut outputs = Vec::new();
         let mut root_input = Vec::new();
         for item in input {
             match item {
-                InputItem::FunctionCallOutput(output) => outputs.push(ClientToolOutput::Function(output.clone())),
-                InputItem::ShellCallOutput(output) => outputs.push(ClientToolOutput::Shell(output.clone())),
-                InputItem::CustomToolCallOutput(output) => outputs.push(ClientToolOutput::Custom(output.clone())),
-                InputItem::ToolSearchOutput(output) => outputs.push(ClientToolOutput::ToolSearch(output.clone())),
-                InputItem::Message(_) => root_input.push(item.clone()),
+                InOutItem::Input(InputItem::FunctionCallOutput(output)) => {
+                    outputs.push(ClientToolOutput::Function(output.clone()));
+                }
+                InOutItem::Input(InputItem::ShellCallOutput(output)) => {
+                    outputs.push(ClientToolOutput::Shell(output.clone()));
+                }
+                InOutItem::Input(InputItem::CustomToolCallOutput(output)) => {
+                    outputs.push(ClientToolOutput::Custom(output.clone()));
+                }
+                InOutItem::Input(InputItem::ToolSearchOutput(output)) => {
+                    outputs.push(ClientToolOutput::ToolSearch(output.clone()));
+                }
+                InOutItem::Input(message @ InputItem::Message(_)) => root_input.push(message.clone()),
+                InOutItem::Output(OutputItem::Message(message)) => {
+                    root_input.push(InputItem::Message(message.clone().into()));
+                }
                 _ => {
                     return Err(invalid(
                         "multi-agent continuation accepts new messages and pending function, shell, custom, or tool-search outputs",
@@ -219,10 +229,12 @@ pub(super) fn restore_agents(
             turn: root.turn,
             state: AgentState::Active(AgentPhase::Runnable),
             mailbox: Vec::new(),
-            history: match &request.enriched_request.input {
-                ResponsesInput::Items(items) => items.clone(),
-                ResponsesInput::Text(_) => Vec::from(&request.enriched_request.input),
-            },
+            history: request
+                .enriched_request
+                .input
+                .input_items()
+                .map(Cow::into_owned)
+                .collect(),
             loaded_tools: Vec::new(),
             last_task: String::new(),
             final_answer: None,
@@ -245,7 +257,7 @@ pub(super) async fn prepare_agent(
     budget: &ExecutorResponseBudget,
 ) -> ExecutorResult<AgentContext> {
     let mut request = parent.enriched_request.clone();
-    request.input = ResponsesInput::Items(stored.history.clone());
+    request.input = ResponsesInput::from(stored.history.clone());
     request.previous_response_id = None;
     request.conversation = None;
     let management = request.context_management.get_or_insert_with(Vec::new);
@@ -263,10 +275,7 @@ pub(super) async fn prepare_agent(
         parent.original_request.tools.is_some(),
     )?;
     // Discovery resolves public search pairs before this private history is used for inference.
-    stored.history = match &request.input {
-        ResponsesInput::Items(items) => items.clone(),
-        ResponsesInput::Text(_) => Vec::from(&request.input),
-    };
+    stored.history = request.input.input_items().map(Cow::into_owned).collect();
     let ctx = RequestContext {
         multi_agent_tree: None,
         original_request: request.clone(),

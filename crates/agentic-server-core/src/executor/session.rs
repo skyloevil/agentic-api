@@ -21,7 +21,9 @@ pub use steering::{SteeringQueue, SteeringSuccessorPublication, SteeringSuccesso
 use super::{ExecutorError, ExecutorResult};
 
 #[cfg(test)]
-use crate::storage::{InOutItem, ResponseMetadata};
+use crate::storage::ResponseMetadata;
+#[cfg(test)]
+use crate::types::io::InOutItem;
 #[cfg(test)]
 use crate::types::io::{InputItem, OutputItem};
 #[cfg(test)]

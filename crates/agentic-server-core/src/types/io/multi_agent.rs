@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(call.call_id, output.call_id);
         assert_ne!(call.id, output.id);
         assert_eq!(
-            serde_json::to_value(ResponsesInput::Items(inputs).model_input()).unwrap(),
+            serde_json::to_value(ResponsesInput::from(inputs).model_input()).unwrap(),
             serde_json::json!([])
         );
     }

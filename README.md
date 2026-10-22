@@ -54,7 +54,7 @@ flowchart LR
 ## ✨ Key Features
 
 - 🔄 **Stateful conversations**: the server manages history via `previous_response_id` or the [Conversations API](#-api-surface). No client-side message tracking, no replaying full transcripts.
-- 🛠️ **Server-side tool execution**: an explicit tool-ownership model (gateway / client / provider) decides exactly what runs where. Web search ships today via [You.com](https://you.com), [Brave Search](https://brave.com/search/api/), [Tavily](https://tavily.com), or a self-hosted [SearXNG](https://docs.searxng.org/) instance, alongside MCP tools and an opt-in [embedded code interpreter](#optional-embedded-code-interpreter); the model executes multi-step tool chains automatically.
+- 🛠️ **Server-side tool execution**: an explicit tool-ownership model (gateway / client / provider) decides exactly what runs where. Web search ships today via [You.com](https://you.com), [Brave Search](https://brave.com/search/api/), [Tavily](https://tavily.com), [Serply](https://serply.io), or a self-hosted [SearXNG](https://docs.searxng.org/) instance, alongside MCP tools and an opt-in [embedded code interpreter](#optional-embedded-code-interpreter); the model executes multi-step tool chains automatically.
 - 🤝 **Multi-agent orchestration**: a stored Responses request can spawn and coordinate subagents server-side over HTTP, returning their attributed work in one response ([details](#-multi-agent-responses)).
 - 📡 **Every transport**: non-streaming HTTP, server-sent events for token streaming, and full **WebSocket** support for interactive clients, with `stream_id` multiplexing.
 - 🧰 **Codex and Claude Code ready**: accepts Codex-shaped Responses traffic and Anthropic Messages traffic, preserving the tool declarations and item shapes each client depends on.
@@ -232,6 +232,13 @@ AGENTIC_WEB_SEARCH_PROVIDER=tavily TAVILY_API_KEY=<your-tavily-api-key> \
   cargo run -p agentic-server -- --llm-api-base http://0.0.0.0:5050
 ```
 
+Or [Serply](https://serply.io), which returns Google results:
+
+```bash
+AGENTIC_WEB_SEARCH_PROVIDER=serply SERPLY_API_KEY=<your-serply-api-key> \
+  cargo run -p agentic-server -- --llm-api-base http://0.0.0.0:5050
+```
+
 Or your own [SearXNG](https://docs.searxng.org/) instance, which needs no API key -- only its URL:
 
 ```bash
@@ -272,12 +279,12 @@ llm_api_base = "http://127.0.0.1:5050"
 # database_url = "postgresql://agentic-api@localhost/agentic_api"
 
 [web_search]
-# Search backend for the gateway-owned web_search tool: "you" (default), "brave", "tavily", or "searxng".
+# Search backend for the gateway-owned web_search tool: "you" (default), "brave", "tavily", "serply", or "searxng".
 provider = "you"
 base_url = "https://ydc-index.io"
 api_key_env = "YOU_API_KEY"
 # Concurrent provider requests inside one batched web-search call; unset uses
-# the provider default (Brave: 1; You.com, Tavily and SearXNG: max_concurrent_gateway_calls).
+# the provider default (Brave: 1; You.com, Tavily, Serply and SearXNG: max_concurrent_gateway_calls).
 # max_concurrent_queries = 1
 
 [web_fetch]
@@ -296,9 +303,12 @@ allowed_hosts = ["mcp.example.com"]
 # Maximum serialized request size in bytes for HTTP bodies and WebSocket
 # messages and frames. Must be greater than zero.
 max_request_body_size_bytes = 10485760
+# Optional per-caller request rate limit; unset disables it.
+# rate_limit_requests_per_minute = 600
+# rate_limit_burst = 600
 
 [tools]
-# Upper bound for gateway-owned calls within one Responses round and for
+# Upper bound for gateway-owned calls within one Responses or Messages round and for
 # provider requests inside a batched web-search call.
 # Must be greater than zero.
 max_concurrent_gateway_calls = 5
@@ -365,12 +375,21 @@ oversized WebSocket messages and frames are rejected by the transport, which clo
 parsed. Order of precedence is `--max-request-body-size-bytes`, then `AGENTIC_MAX_REQUEST_BODY_SIZE_BYTES`, then this
 file setting.
 
+`rate_limit_requests_per_minute` turns on a per-caller request rate limit on every API route and on each WebSocket
+`response.create`; it is off when unset. `rate_limit_burst` sets how many requests a caller may send at once
+and defaults to the per-minute rate. A caller over its limit receives `429` with `retry-after`. The limit is per
+process, so N replicas allow N times the rate. Order of precedence is `--rate-limit-requests-per-minute` and
+`--rate-limit-burst`, then `AGENTIC_RATE_LIMIT_REQUESTS_PER_MINUTE` and `AGENTIC_RATE_LIMIT_BURST`, then these file
+settings. Callers are told apart by their OIDC identity, otherwise by peer address, never by a credential the
+gateway does not verify. Behind a proxy every request shares the proxy's address, so enable OIDC for per-caller limits.
+See [Rate limits](docs/api/index.md#rate-limits) for how callers are identified.
+
 `api_key_env` names the process environment variable containing the web-search credential; it does not contain the
 credential itself. When it is unset, the selected provider's conventional variable is read (`YOU_API_KEY`,
 `BRAVE_API_KEY`, or `TAVILY_API_KEY`). Newly generated files leave `api_key_env` unset so changing providers also changes the default
 credential variable. `AGENTIC_WEB_SEARCH_PROVIDER`, `AGENTIC_WEB_SEARCH_BASE_URL`, `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES`,
-`AGENTIC_MCP_ALLOWED_HOSTS`, `AGENTIC_MAX_REQUEST_BODY_SIZE_BYTES`, and `AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS` can
-override their typed file settings; `YOU_API_BASE_URL` is still honored as the endpoint override when the provider is
+`AGENTIC_MCP_ALLOWED_HOSTS`, `AGENTIC_MAX_REQUEST_BODY_SIZE_BYTES`, `AGENTIC_RATE_LIMIT_REQUESTS_PER_MINUTE`,
+`AGENTIC_RATE_LIMIT_BURST`, and `AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS` can override their typed file settings; `YOU_API_BASE_URL` is still honored as the endpoint override when the provider is
 `you`. The concurrency values are sliding-window upper bounds; handlers may further serialize calls to the same tool
 name. The MCP allowlist is used only for request-declared remote MCP URLs; configured `[mcp_servers]` entries are trusted
 operator configuration.
@@ -408,9 +427,9 @@ every provider.
 | Setting | Environment variable | `config.toml` key | Default |
 | :--- | :--- | :--- | :--- |
 | Provider | `AGENTIC_WEB_SEARCH_PROVIDER` | `[web_search] provider` | `you` |
-| API key | variable named by `api_key_env` | `[web_search] api_key_env` | `YOU_API_KEY` / `BRAVE_API_KEY` / `TAVILY_API_KEY` / `SEARXNG_API_KEY` (optional) |
-| Endpoint | `AGENTIC_WEB_SEARCH_BASE_URL` (or `YOU_API_BASE_URL` for You.com) | `[web_search] base_url` | none for You.com; `https://api.search.brave.com` for Brave; `https://api.tavily.com` for Tavily; **required** for SearXNG |
-| Concurrent queries | `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` | `[web_search] max_concurrent_queries` | You.com, Tavily and SearXNG inherit `max_concurrent_gateway_calls`; Brave `1` |
+| API key | variable named by `api_key_env` | `[web_search] api_key_env` | `YOU_API_KEY` / `BRAVE_API_KEY` / `TAVILY_API_KEY` / `SERPLY_API_KEY` / `SEARXNG_API_KEY` (optional) |
+| Endpoint | `AGENTIC_WEB_SEARCH_BASE_URL` (or `YOU_API_BASE_URL` for You.com) | `[web_search] base_url` | none for You.com; `https://api.search.brave.com` for Brave; `https://api.tavily.com` for Tavily; `https://api.serply.io` for Serply; **required** for SearXNG |
+| Concurrent queries | `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` | `[web_search] max_concurrent_queries` | You.com, Tavily, Serply and SearXNG inherit `max_concurrent_gateway_calls`; Brave `1` |
 
 **You.com** (`provider = "you"`) is the default and behaves exactly as before: domain filters are applied by the
 provider, `count` accepts 1–100, and the You.com-specific `livecrawl`, `livecrawl_formats`, `crawl_timeout`, and
@@ -457,8 +476,29 @@ key sent as a bearer token. The gateway adapts the shared tool contract to Tavil
   `web_search_call` without an automatic retry and reports the upstream `Retry-After` value; Tavily's plan-limit
   statuses (432, 433) fail the same way without a retry.
 
-If you switch an existing deployment to Brave or Tavily, update `api_key_env` if an older `config.toml` pins it (or
-remove it) and drop a You.com `base_url`; a mismatched key variable is reported in the failed `web_search_call`
+**Serply** (`provider = "serply"`) needs only `SERPLY_API_KEY` and returns Google results; its
+[plans](https://serply.io) are metered per request. Requests are `GET`s against `https://api.serply.io/v1/search` with
+the key sent in the `X-Api-Key` header. The gateway adapts the shared tool contract to Serply:
+
+- `allowed_domains` / `blocked_domains` (and the model's `include_domains` / `exclude_domains`) are sent as `site:` /
+  `-site:` query operators and re-checked by the gateway on the response as defense in depth, so a filtered search can
+  return fewer than `count` results.
+- `count` is clamped to Serply's maximum of 10 (`num`), and extra results are trimmed; `freshness` maps to Google's
+  `tbs=qdr:d`/`w`/`m`/`y`, while a date range becomes `after:` / `before:` operators with the end widened by one day so
+  both boundary dates stay in scope; `country` maps to `gl`; `safesearch: "strict"` becomes `safe=active`.
+- `language` sets Google's interface language `hl` and, for the languages Google can restrict results to, the
+  result-language restrict `lr` (`ja` becomes `lr=lang_ja`, `zh-TW` becomes `lr=lang_zh-TW`); any other language is
+  sent as `hl` only.
+- All hits land in `results.web` and `results.news` is always empty. Google redirect links
+  (`https://www.google.com/url?q=...`) are unwrapped to the target URL, and `page_age` carries Serply's
+  `published_time` when present.
+- The You.com-specific arguments above are ignored (logged at debug level).
+- Each per-query `metadata[]` entry carries `"provider": "serply"` plus Serply's `ts` as `latency`.
+- Batched queries inherit the gateway concurrency limit. A rate-limited request (HTTP 429) fails that
+  `web_search_call` without an automatic retry and reports the upstream `Retry-After` value.
+
+If you switch an existing deployment to Brave, Tavily, or Serply, update `api_key_env` if an older `config.toml` pins
+it (or remove it) and drop a You.com `base_url`; a mismatched key variable is reported in the failed `web_search_call`
 message. Example:
 
 ```toml
@@ -642,7 +682,7 @@ Claude Code's own tools (Bash, Edit, Read, …) stay **client-owned** — Claude
 
 Current Claude Code versions declare Anthropic's native `web_search_20250305` server tool. Agentic API translates that
 declaration for the upstream model and executes the resulting search server-side against the configured search backend
-(You.com, Brave Search, Tavily, or SearXNG, see [Web search providers](#web-search-providers)); no MCP server or tool
+(You.com, Brave Search, Tavily, Serply, or SearXNG, see [Web search providers](#web-search-providers)); no MCP server or tool
 alias is required:
 
 ```bash

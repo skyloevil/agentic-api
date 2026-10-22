@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::types::io::InOutItem;
 use serde_json::json;
 
 use super::*;
@@ -204,9 +206,9 @@ fn preparation_retains_mcp_list_metadata_until_upstream_projection() {
         panic!("expected prepared item input");
     };
     assert!(
-        prepared_items
-            .iter()
-            .any(|item| matches!(item, InputItem::McpListTools(list) if list.server_label == "counter"))
+        prepared_items.iter().any(
+            |item| matches!(item, InOutItem::Input(InputItem::McpListTools(list)) if list.server_label == "counter")
+        )
     );
 
     let model_input = request.input.model_input();
@@ -216,7 +218,7 @@ fn preparation_retains_mcp_list_metadata_until_upstream_projection() {
     assert!(
         model_items
             .iter()
-            .all(|item| !matches!(item, InputItem::McpListTools(_)))
+            .all(|item| !matches!(item, InOutItem::Input(InputItem::McpListTools(_))))
     );
 }
 

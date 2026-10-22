@@ -1,7 +1,7 @@
 //! Domain type for conversation storage.
 
 use super::super::models::Conversation as StorageDbConversation;
-use super::item::InOutItem;
+use crate::types::io::InOutItem;
 
 /// Version of a conversation snapshot, including item mutations and legacy state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -236,14 +236,26 @@ async fn tagged_enum_discriminators_present() {
                 .or_else(|| variant["allOf"][0]["properties"]["type"]["enum"][0].as_str())
         })
         .collect();
-    assert!(
-        type_values.contains(&"compaction_trigger"),
-        "InputItem missing 'compaction_trigger', got: {type_values:?}"
+    for expected in ["compaction_trigger", "message", "web_search_call", "mcp_call"] {
+        assert!(
+            type_values.contains(&expected),
+            "InputItem missing '{expected}', got: {type_values:?}"
+        );
+    }
+    assert!(schemas.get("ConversationItem").is_none());
+    assert_eq!(schemas["InOutItem"]["$ref"], "#/components/schemas/InputItem");
+    assert_eq!(
+        schemas["ResponsesInput"]["oneOf"][1]["items"]["$ref"],
+        "#/components/schemas/InOutItem"
     );
-    assert!(
-        type_values.contains(&"message"),
-        "InputItem missing 'message', got: {type_values:?}"
-    );
+    let output_types = schemas["OutputItem"]["oneOf"].as_array().unwrap();
+    for kind in ["web_search_call", "mcp_call"] {
+        assert!(
+            output_types
+                .iter()
+                .any(|variant| variant["allOf"][0]["properties"]["type"]["enum"][0] == kind)
+        );
+    }
 }
 
 #[tokio::test]

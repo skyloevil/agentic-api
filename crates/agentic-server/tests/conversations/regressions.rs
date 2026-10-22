@@ -1,5 +1,5 @@
 use super::*;
-use agentic_core::types::ConversationItem;
+use agentic_core::types::InOutItem;
 
 async fn create_conversation_with_items(url: &str, items: Vec<serde_json::Value>) -> String {
     let response = reqwest::Client::new()
@@ -81,7 +81,7 @@ async fn regression_list_descending_order() {
 fn regression_output_item_roundtrip() {
     let wire = json!({"type":"web_search_call", "id":"ws_1", "status":"completed",
         "action":{"type":"search", "query":"weather", "queries":["weather"], "sources":[{"url":"https://example.com"}]}});
-    let parsed: ConversationItem = serde_json::from_value(wire.clone()).unwrap();
+    let parsed: InOutItem = serde_json::from_value(wire.clone()).unwrap();
     let actual = serde_json::to_value(parsed).unwrap();
     assert_eq!(actual, wire);
 }

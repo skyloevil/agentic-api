@@ -2,20 +2,19 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn preserves_output_only_items_and_rejects_unknown_types() {
+fn gateway_calls_keep_their_payload_and_unknown_types_are_rejected() {
     for wire in [
         json!({"type":"web_search_call", "id":"ws_1", "status":"completed", "action":{"type":"search", "query":"weather", "queries":["weather"], "sources":[{"url":"https://example.com"}]}}),
         json!({"type":"mcp_call", "id":"mcp_1", "name":"weather", "server_label":"weather", "arguments":"{}", "output":"sunny", "status":"completed"}),
     ] {
-        let item: ConversationItem = serde_json::from_value(wire.clone()).unwrap();
-        assert!(matches!(item, ConversationItem::Output(_)));
+        let item: InOutItem = serde_json::from_value(wire.clone()).unwrap();
         let actual = serde_json::to_value(item).unwrap();
         for (key, value) in wire.as_object().unwrap() {
             assert_eq!(&actual[key], value, "{key}");
         }
     }
-    assert!(serde_json::from_value::<ConversationItem>(json!({"type":"future_item", "payload":42})).is_err());
-    assert!(serde_json::from_value::<ConversationItem>(json!({"type":"function_call_output"})).is_err());
+    assert!(serde_json::from_value::<InOutItem>(json!({"type":"future_item", "payload":42})).is_err());
+    assert!(serde_json::from_value::<InOutItem>(json!({"type":"function_call_output"})).is_err());
 }
 
 #[test]
@@ -47,8 +46,7 @@ fn batch_requests_and_empty_pages_match_wire_contract() {
 
 #[test]
 fn manually_added_assistant_shorthand_remains_input_text() {
-    let item: ConversationItem =
-        serde_json::from_value(json!({"type":"message", "role":"assistant", "content":"9"})).unwrap();
+    let item: InOutItem = serde_json::from_value(json!({"type":"message", "role":"assistant", "content":"9"})).unwrap();
     let resource = ItemResponse::new("msg_manual".into(), item);
     let actual = serde_json::to_value(resource).unwrap();
     assert_eq!(actual["role"], "assistant");

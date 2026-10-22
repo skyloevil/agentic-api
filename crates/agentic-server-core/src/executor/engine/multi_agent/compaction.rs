@@ -10,7 +10,7 @@ use crate::executor::{
 };
 use crate::types::{
     agent_tree::StoredTreeSnapshot,
-    io::{CompactionItem, InputItem, ResponseUsage},
+    io::{CompactionItem, InOutItem, InputItem, ResponseUsage},
 };
 
 impl MultiAgentRun {
@@ -23,7 +23,8 @@ impl MultiAgentRun {
     ) -> ExecutorResult<(CompactionItem, ResponseUsage, Option<String>)> {
         let budget = ExecutorResponseBudget::with_limit(exec.responses_config.max_retained_bytes);
         let mut restored = restore_agents(ctx, exec, &budget)?;
-        ctx.new_input_items.retain(|item| !item.is_compaction_trigger());
+        ctx.new_input_items
+            .retain(|item| !matches!(item, InOutItem::Input(InputItem::CompactionTrigger)));
         if restored.continuing_tree && !ctx.new_input_items.is_empty() {
             restored.continue_input(&ctx.response_id, &ctx.new_input_items)?;
         }

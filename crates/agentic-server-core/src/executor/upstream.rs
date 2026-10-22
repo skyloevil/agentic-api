@@ -1,10 +1,8 @@
 use crate::executor::accumulator::Validation;
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::gateway::history::append_input_item;
 use crate::executor::inference::{call_inference_limited, fetch_response_json_limited};
 use crate::executor::multi_agent::collaboration;
 use crate::executor::pipeline::AgentPipeline;
-use crate::executor::rehydrate::validate_message_content;
 use crate::executor::relay::StreamRelay;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
@@ -78,8 +76,6 @@ fn upstream_request_with_guidance(
     guidance: Option<&InputMessage>,
     withheld: Option<&ToolRegistry>,
 ) -> ExecutorResult<String> {
-    // Composable callers may supply RequestContext without the rehydration step.
-    validate_message_content(&ctx.enriched_request.input)?;
     let mut request = ctx.enriched_request.to_upstream_request(stream)?;
     if let Some(registry) = withheld {
         if let Some(tools) = request.tools.as_mut() {
@@ -106,7 +102,7 @@ fn upstream_request_with_guidance(
         tools.extend(collaboration::tools());
     }
     if let Some(guidance) = guidance {
-        append_input_item(request.input.to_mut(), InputItem::Message(guidance.clone()));
+        request.input.to_mut().push(InputItem::Message(guidance.clone()));
     }
     serialize_to_string(&request).map_err(ExecutorError::JsonError)
 }

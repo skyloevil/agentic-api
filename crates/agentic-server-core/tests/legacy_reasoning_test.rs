@@ -6,8 +6,9 @@ mod support;
 use std::sync::Arc;
 
 use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionContext, ExecutorError, ResponseHandler};
-use agentic_core::storage::{ConversationStore, InOutItem, ResponseMetadata, ResponseStore, StorageError};
+use agentic_core::storage::{ConversationStore, ResponseMetadata, ResponseStore, StorageError};
 use agentic_core::types::ReasoningStatus;
+use agentic_core::types::io::InOutItem;
 use agentic_core::types::io::{InputItem, OutputItem, ReasoningOutput, ReasoningTextContent, ReasoningTextKind};
 use agentic_core::types::request_response::RequestPayload;
 use serde_json::{Value, json};

@@ -115,7 +115,7 @@ async fn test_conversation_delete_with_tenant_scoping() {
 
 #[tokio::test]
 async fn test_conversation_create_with_initial_items() {
-    use agentic_core::storage::InOutItem;
+    use agentic_core::types::io::InOutItem;
     use agentic_core::types::io::{InputItem, InputMessage, InputMessageContent};
 
     let pool = setup_pool().await;

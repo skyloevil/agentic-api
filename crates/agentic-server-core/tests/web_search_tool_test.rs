@@ -1906,7 +1906,7 @@ async fn execute_returns_mixed_client_tool_calls_without_followup_model_request(
 
     let continuation_payload = RequestPayload {
         previous_response_id: Some(response.id),
-        ..base_payload(ResponsesInput::Items(vec![InputItem::FunctionCallOutput(
+        ..base_payload(ResponsesInput::from(vec![InputItem::FunctionCallOutput(
             FunctionToolResultMessage {
                 call_id: "call_weather".to_owned(),
                 output: ToolCallOutput::Text("{\"city\":\"San Francisco\",\"temperature_c\":18}".to_owned()),

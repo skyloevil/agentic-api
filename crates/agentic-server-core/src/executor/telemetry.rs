@@ -201,9 +201,11 @@ impl From<&ExecutorError> for FailureCategory {
             ExecutorError::StreamError(_) => Self::Stream,
             ExecutorError::NotFound { .. } | ExecutorError::PreviousResponseNotFound { .. } => Self::NotFound,
             ExecutorError::InvalidRequest(_)
+            | ExecutorError::InvalidInput(_)
             | ExecutorError::InvalidMaxToolCalls(_)
             | ExecutorError::InvalidPromptCacheOptions(_)
-            | ExecutorError::UnsupportedValue { .. } => Self::InvalidRequest,
+            | ExecutorError::UnsupportedValue { .. }
+            | ExecutorError::UnsupportedParameter(_) => Self::InvalidRequest,
             ExecutorError::PayloadTooLarge(_) => Self::PayloadTooLarge,
             ExecutorError::ResourceLimitExceeded { .. } => Self::ResourceLimit,
             ExecutorError::Conflict(_) => Self::Conflict,

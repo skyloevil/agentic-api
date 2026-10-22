@@ -1,6 +1,7 @@
 //! Response storage handler — owns all response store operations.
 
-use crate::storage::{InOutItem, ResponseData, ResponseMetadata, ResponseStore};
+use crate::storage::{ResponseData, ResponseMetadata, ResponseStore};
+use crate::types::io::InOutItem;
 use crate::types::io::OutputItem;
 use crate::types::request_response::ResponsePayload;
 
@@ -135,7 +136,7 @@ impl ResponseHandler {
         let continuation = ctx.continuation.take();
         let write_durable = continuation.is_none() || ctx.original_request.store;
         let mut new_items = Vec::with_capacity(ctx.new_input_items.len() + output_items.len());
-        new_items.extend(ctx.new_input_items.into_iter().map(InOutItem::Input));
+        new_items.extend(ctx.new_input_items);
         new_items.extend(
             output_items
                 .into_iter()

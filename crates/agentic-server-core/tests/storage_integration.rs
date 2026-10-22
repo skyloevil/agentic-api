@@ -5,8 +5,9 @@ use agentic_core::storage::ResponseMetadata;
 use agentic_core::storage::{
     ConversationStore, ResponseStore, create_pool_with_schema, create_pool_with_schema_and_sqlite_config,
 };
-use agentic_core::storage::{ConversationVersion, InOutItem, StorageError};
+use agentic_core::storage::{ConversationVersion, StorageError};
 use agentic_core::types::event::MessageStatus;
+use agentic_core::types::io::InOutItem;
 use agentic_core::types::io::{InputItem, InputMessage, InputMessageContent, OutputItem, OutputMessage};
 use std::sync::Arc;
 

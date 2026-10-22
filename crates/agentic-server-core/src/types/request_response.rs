@@ -5,6 +5,7 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::io::input::InputValidationError;
 use super::io::{FunctionTool, InputItem, MultiAgentConfig, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use super::tools::ResponsesTool;
 use crate::tool::async_execution::lower_async_calls;
@@ -19,6 +20,7 @@ mod response_stream;
 mod serde_helpers;
 mod standard_response;
 mod text_config;
+mod unsupported;
 pub use max_tool_calls::{JsonKind, MAX_TOOL_CALLS_PARAM, MaxToolCalls, MaxToolCallsError, OutOfRangeInteger};
 use serde_helpers::{
     default_true, deserialize_conversation, is_absent_or_default_tool_choice, serialize_conversation_object,
@@ -26,6 +28,7 @@ use serde_helpers::{
 };
 pub use standard_response::{ResponseReasoning, StandardResponseFields};
 pub use text_config::{ResponseTextConfig, ResponseTextFormat};
+pub use unsupported::{BACKGROUND_PARAM, Background, PROMPT_PARAM, RejectedValue, UnsupportedParameterError};
 #[cfg(feature = "openapi")]
 mod schema;
 
@@ -111,6 +114,22 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig, C = PromptCacheOptions
     pub cache_salt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagement>>,
+    /// Detection only, never serialized: typed execution rejects `true` (background mode is #357)
+    /// and a non-boolean value.
+    #[serde(default, skip_serializing)]
+    pub background: Option<Background>,
+    /// Detection only, never serialized: typed execution rejects any non-null value.
+    #[serde(default, skip_serializing)]
+    pub prompt: Option<RejectedValue>,
+}
+
+/// Validation failures while constructing a typed upstream request.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamRequestError {
+    #[error(transparent)]
+    Input(#[from] InputValidationError),
+    #[error(transparent)]
+    Tool(#[from] ToolError),
 }
 
 #[derive(Debug, Serialize)]
@@ -277,6 +296,8 @@ impl<T: ?Sized, C> RequestPayload<T, C> {
             multi_agent: self.multi_agent,
             cache_salt: self.cache_salt,
             context_management: self.context_management,
+            background: self.background,
+            prompt: self.prompt,
         })
     }
 }
@@ -311,11 +332,13 @@ impl RequestPayload {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Config`] when a Codex namespace member's generated
+    /// Rejects unsupported message content before normalization. Returns a tool
+    /// validation error when a Codex namespace member's generated
     /// flat name collides with a top-level function tool or another namespace
     /// member, or when a custom tool declares a format whose constrained
     /// decoding cannot be preserved upstream.
-    pub fn to_upstream_request(&self, stream: bool) -> Result<UpstreamRequest<'_>, ToolError> {
+    pub fn to_upstream_request(&self, stream: bool) -> Result<UpstreamRequest<'_>, UpstreamRequestError> {
+        self.input.validate()?;
         // This is only the upstream model-generation preference: it controls
         // whether the model may emit parallel calls, not how the gateway
         // schedules calls after inference. Forward an explicit client value;
@@ -344,7 +367,7 @@ impl RequestPayload {
         let tools = tools.filter(|tools| !tools.is_empty());
         let namespace_map = CodexNamespaceHandler.build_namespace_map(declarations.as_deref())?;
         let input = lower_async_calls(
-            CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input()),
+            CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input()?),
         );
         let tool_choice = CodexNamespaceHandler.resolve_tool_choice(namespace_map.as_ref(), self.tool_choice.as_ref());
         CustomHandler::validate_tool_choice(declarations.as_deref(), &tool_choice)?;
@@ -465,6 +488,7 @@ pub struct ResponsePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::io::InOutItem;
 
     #[test]
     fn prompt_cache_retention_survives_text_mapping_and_request_round_trip() {
@@ -1431,16 +1455,26 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_discards_unknown_items_when_converted_for_storage() {
-        let input: ResponsesInput = serde_json::from_value(serde_json::json!([
-            {"type": "message", "role": "user", "content": "hi"},
-            {"type": "future_item", "payload": {"a": 1}}
+    fn legacy_unknown_items_are_omitted_from_model_conversion() {
+        let mut items: Vec<InOutItem> = serde_json::from_value(serde_json::json!([
+            {"type": "message", "role": "user", "content": "hi"}
         ]))
         .unwrap();
+        items.push(InOutItem::Output(OutputItem::Unknown));
+        let input = ResponsesInput::from(items);
 
         let items = Vec::<InputItem>::from(&input);
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], InputItem::Message(_)));
+    }
+
+    #[test]
+    fn responses_input_rejects_unknown_items() {
+        let input = serde_json::from_value::<ResponsesInput>(serde_json::json!([
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "future_item", "payload": {"a": 1}}
+        ]));
+        assert!(input.is_err(), "an unmodeled item type fails at the boundary");
     }
 
     #[test]

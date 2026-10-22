@@ -10,10 +10,12 @@ use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::executor::prepare::prepare_request_tools;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::telemetry::metrics::{ExecutorMetrics, Stage};
-use crate::storage::{InOutItem, ResponseMetadata};
+use crate::storage::ResponseMetadata;
 use crate::tool::{ToolSearchMetadata, ToolSearchState};
 use crate::types::event::ResponseStatus;
-use crate::types::io::{InputItem, OutputItem};
+use crate::types::io::InOutItem;
+use crate::types::io::OutputItem;
+use crate::types::io::input::model_items;
 use crate::types::request_response::ResponsePayload;
 use tracing::error;
 
@@ -271,13 +273,12 @@ async fn validate_output_call_ids(
     if ctx.continuation.is_some() {
         // Rehydration already combined the pinned parent with normalized input.
         // Validate that effective window, excluding calls superseded by compaction.
-        return validate_history_call_ids(
-            ctx.enriched_request.input.model_items().map(InputItem::call_id),
-            &call_ids,
-        );
+        let projected = ctx.enriched_request.input.input_items().collect();
+        let items: Vec<_> = model_items(projected).collect();
+        return validate_history_call_ids(items.iter().map(|item| item.call_id()), &call_ids);
     }
     let history = resp_handler.rehydrate(ctx).await?;
-    validate_history_call_ids(history.iter().map(stored_call_id), &call_ids)?;
+    validate_history_call_ids(history.iter().map(InOutItem::call_id), &call_ids)?;
     for (input_index, item) in ctx.new_input_items.iter().enumerate() {
         if let Some((output_index, item_type)) = item.call_id().and_then(|call_id| call_ids.get(call_id)) {
             return Err(ExecutorError::InvalidRequest(format!(
@@ -300,15 +301,4 @@ fn validate_history_call_ids<'a>(
         }
     }
     Ok(())
-}
-
-fn stored_call_id(item: &InOutItem) -> Option<&str> {
-    match item {
-        InOutItem::Input(item) => item.call_id(),
-        InOutItem::Output(OutputItem::FunctionCall(call)) => Some(&call.call_id),
-        InOutItem::Output(OutputItem::ToolSearchCall(call)) => Some(&call.call_id),
-        InOutItem::Output(OutputItem::CustomToolCall(call)) => Some(&call.call_id),
-        InOutItem::Output(OutputItem::ShellCall(call)) => Some(&call.call_id),
-        InOutItem::Output(_) => None,
-    }
 }

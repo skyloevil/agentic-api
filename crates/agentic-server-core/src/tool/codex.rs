@@ -1,3 +1,5 @@
+use crate::types::io::InOutItem;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -294,7 +296,7 @@ impl CodexNamespaceHandler {
             return input;
         };
         let should_rewrite = matches!(&*input, ResponsesInput::Items(items) if items.iter().any(|item| {
-            matches!(item, InputItem::FunctionCall(call)
+            matches!(item, InOutItem::Input(InputItem::FunctionCall(call))
                 if call.namespace.as_deref().is_some_and(|namespace| {
                     map.mapping_for_member(namespace, &call.name).is_some()
                 }))
@@ -355,7 +357,7 @@ fn rewrite_input_with_map(input: &mut ResponsesInput, map: &NamespaceMap) {
         return;
     };
     for item in items {
-        let InputItem::FunctionCall(call) = item else {
+        let InOutItem::Input(InputItem::FunctionCall(call)) = item else {
             continue;
         };
         let Some(namespace) = call.namespace.as_deref() else {

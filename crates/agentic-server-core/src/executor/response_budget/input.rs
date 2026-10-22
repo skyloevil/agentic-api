@@ -1,4 +1,6 @@
 //! Logical retained-size accounting for canonical input and accepted steering.
+use crate::types::io::InOutItem;
+
 use super::{RETAINED_CONTAINER_OVERHEAD_BYTES, RetainedSize, opt_len};
 use crate::types::io::{InputContent, InputItem, InputMessage, InputMessageContent, RefusalContent, ResponsesInput};
 use crate::types::websocket::SteeringInput;
@@ -46,7 +48,7 @@ impl RetainedSize for SteeringInput {
         match self.as_ref() {
             ResponsesInput::Text(text) => RETAINED_CONTAINER_OVERHEAD_BYTES.saturating_add(text.len()),
             ResponsesInput::Items(items) => items.iter().fold(RETAINED_CONTAINER_OVERHEAD_BYTES, |bytes, item| {
-                let InputItem::Message(message) = item else {
+                let InOutItem::Input(InputItem::Message(message)) = item else {
                     // SteeringInput guarantees user messages. Fail closed if
                     // that invariant changes before this accounting is updated.
                     return usize::MAX;
