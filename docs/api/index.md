@@ -354,7 +354,14 @@ unchanged on supported parts, without interpreting them as valid cache policies.
 | Image defaults and client tool normalization | Adding image `detail: "auto"` or lowering custom outputs to function outputs preserves content extensions, including structured text/image/file tool outputs |
 | Gateway tool rounds and multi-agent history forks | Original text/image boundaries remain in every inference round that carries those items |
 | Standalone, automatic, and trigger compaction | Summary inference receives original boundaries; retained user parts keep theirs; boundaries on replaced content are not moved to the generated summary |
-| File or unknown message content on typed routes | Rejected before inference or storage; direct HTTP still passes it through |
+| Inline UTF-8 text message files | Supported base64 `file_data` becomes model-facing `input_text` in place, retaining its cache breakpoint; canonical and stored history keep the original `input_file` |
+| Unsupported message files or unknown content on typed routes | File IDs/URLs, unsupported non-text files, invalid base64/UTF-8, and unknown content types are rejected before inference or storage; direct HTTP still passes them through |
+
+Text-file inlining prefixes decoded text with `File: <filename>` when a filename
+is present. Only the shared `prompt_cache_breakpoint` extension is carried onto the
+new text part; file-only extension fields stay on the original file in history.
+This preserves a boundary at the same content position, without claiming identical
+provider tokenization or cache reuse before and after conversion.
 
 Restoring a marked content part does not inherit its parent's top-level
 `prompt_cache_options`: repeat those options on a new request when needed.
