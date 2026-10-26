@@ -118,11 +118,11 @@ boundaries; see [HTTP multi-agent execution](#http-multi-agent-execution).
 
 The crate produces a library plus two independent binaries. `src/lib.rs` exports
 `agentic_cli`, `agentic_harness`, `agentic_output`, `agentic_process`, `app`, `auth`,
-`handler`, and `model_capabilities`. On top of that:
+`handler`, `model_capabilities`, and `rate_limit`. On top of that:
 
 | Binary | Entry point | Uses |
 |---|---|---|
-| `agentic-server` (the gateway) | `src/main.rs` | `app`, `auth`, `handler`, `model_capabilities`, plus binary-private `server.rs` and `config_file.rs` |
+| `agentic-server` (the gateway) | `src/main.rs` | `app`, `auth`, `handler`, `model_capabilities`, `rate_limit`, plus binary-private `server.rs`, `config_file.rs`, and `server_settings.rs` |
 | `agentic` (the CLI launcher) | `src/bin/agentic.rs` | `agentic_cli`, `agentic_harness`, `agentic_output`, `agentic_process`, `model_capabilities` |
 
 These are two unrelated concerns bundled in one crate. If you're working on request
@@ -142,14 +142,25 @@ what stops the HTTP catalog and a launcher catalog from disagreeing about image 
 - **`app.rs`** (library) builds the router: `AppState` (the per-request-shared state:
   `exec_ctx: Arc<ExecutionContext>`, proxy state, readiness/websocket trackers, config)
   and `build_router_with_auth(state, server_config, authenticator)`, which wires every
-  route and optionally layers OIDC auth (`auth::require_oidc`) onto the protected ones.
+  route and layers [request admission](#request-admission-authentication-then-rate-limits)
+  onto the protected ones: optional OIDC auth (`auth::require_oidc`), then optional rate
+  limiting (`rate_limit::enforce_rate_limit`).
 - **`server.rs`** (binary-private) owns process lifecycle: `build_state` (constructs
   `ExecutionContext::from_config`, i.e. where the DB pool actually gets created),
   `serve_gateway`/`serve_gateway_until_signal` (bind, serve, graceful shutdown with a
   bounded drain), and `run`/`run_with_llm` (standalone mode, optionally spawning a vLLM
-  subprocess).
+  subprocess). It serves with `into_make_service_with_connect_info::<SocketAddr>()`, so
+  middleware can read each connection's peer address.
 - **`main.rs`** (binary-private) is the `clap` CLI front end: parses config from
   flags/env/`config.toml`, then calls `server::run` or `server::run_with_llm`.
+- **`server_settings.rs`** (binary-private) resolves the gateway admission settings from
+  the `[server]` table: the request body size ceiling (`resolve_max_request_body_size`)
+  and the per-caller rate limit (`resolve_rate_limit`, which returns `None` when no rate
+  is set and rejects a burst without a rate). Each setting resolves as CLI argument >
+  environment variable > configuration file > default, and an explicit CLI argument
+  skips the lower sources, so a malformed inherited environment value cannot block
+  startup. `generated_server_file_config` records the same environment variables when
+  `main.rs` generates a configuration file.
 
 ### HTTP handlers (`handler/http/`)
 
@@ -172,18 +183,35 @@ what stops the HTTP catalog and a launcher catalog from disagreeing about image 
 | `GET /health` | `health` | `handler/http/models.rs` |
 | `GET /ready` | `ready` | `handler/http/models.rs` |
 
-Handlers make a request-scoped decision between two paths:
-- **Stateful/executor path** — used when the request needs state (`store: true`,
-  `previous_response_id`, `conversation_id`, compaction, or a gateway-owned tool).
-  Builds an `ExecuteRequest` (Responses) or calls `run_messages_loop`/
-  `run_messages_stream` (Messages) against `state.exec_ctx`.
-- **Pass-through path** — everything else is forwarded to vLLM unchanged via
-  `agentic_core::proxy`, with no state, no persistence.
+The HTTP Responses handler parses a typed `RequestPayload` and always builds an
+`ExecuteRequest` against `state.exec_ctx`. Both `store: true` and `store: false`
+requests use input normalization, tool normalization, validation, and the tool loop.
+Unmodeled top-level provider parameters, such as `chat_template_kwargs` and `top_k`,
+are retained in `RequestPayload::extra` and borrowed by `UpstreamRequest` for forwarding
+on each inference round. Known fields keep their typed validation and conversion;
+gateway state controls and WebSocket event metadata are not provider extensions.
+With `store: false` and no state IDs, execution does not rehydrate stored history or
+persist the turn. Clients supply the complete item history in `input`, including
+prior output items and tool call outputs. `previous_response_id` still loads an
+available stored parent; `store: false` prevents the new response from being stored.
+An explicit `conversation` loads its stored history, but `store: false` does not
+append the new input/output items or store the response.
 
-The HTTP Responses handler first parses `RequestPayload<RawValue>` so routing fields
-remain typed while provider-specific `text` formats stay opaque on the pass-through
-path. Executor routes convert that raw field to `ResponseTextConfig` before
-building `ExecuteRequest`, preserving strict validation for in-process execution.
+`UpstreamRequest` carries `store:false` whenever gateway storage is disabled.
+Typed admission still rejects unsupported body shapes. Provider reasoning context
+and opaque-state compatibility require coordinated backend work, tracked in
+[#444](https://github.com/vllm-project/agentic-api/issues/444).
+
+HTTP execution supplies request-scoped headers through `with_upstream_headers`, using
+the proxy's existing end-to-end filter and authentication fallback. These headers
+travel through every inference and compaction round, without entering stored state.
+`run_http` polls the same stream-owned producer until the first client frame, allowing
+initial upstream failures to retain their HTTP status and processed response headers.
+Later failures remain SSE events. Embedded `run` callers keep lazy stream startup.
+
+The Messages handler selects `run_messages_loop`/`run_messages_stream` for requests
+that need gateway execution. Other requests and pass-through endpoints forward to
+the upstream through `agentic_core::proxy`.
 
 ### WebSocket transport (`handler/websocket/`)
 
@@ -461,7 +489,7 @@ For response-scoped session execution, `store: false` has no durable writes or
 database fallback. A stored child of a transient parent persists the complete
 canonical window without creating a row or dangling database reference for that
 parent. Explicit `conversation_id` requests keep the existing durable Conversations
-policy and append output only through the conversation handler. Their session lease
+policy: only `store: true` appends through the conversation handler. Their session lease
 still serializes execution without recording a second copy. Core commit supports
 prewarming without inference; WebSocket `generate: false` uses that same session
 rehydration and commit path.
@@ -477,7 +505,65 @@ rendering an `ExecutorError` as a JSON error body.
 OIDC bearer-token authentication: discovery, JWKS fetch/cache/refresh, and the
 `require_oidc` axum middleware layered onto protected routes in `app.rs`. The
 WebSocket handler also reads the resulting `AuthenticatedPrincipal` extension directly,
-to detect token expiry mid-session.
+to detect token expiry mid-session. `auth/api_key.rs` holds `require_api_key`, which
+guards stored-response retrieval when OIDC is off and `OPENAI_API_KEY` is set, because
+that route reads local storage and never reaches an upstream that would check the key.
+
+### Request admission: authentication, then rate limits
+
+`build_router_with_auth` applies `route_layer` to the protected routes twice. Axum runs
+the layer added last first, so the rate-limit layer is added before the OIDC layer, and
+every protected request is admitted in this order:
+
+1. `auth::require_oidc` (when OIDC is configured) verifies the bearer token and inserts
+   the `AuthenticatedPrincipal`, or rejects with 401 (503 if the identity provider is
+   unavailable).
+2. `rate_limit::enforce_rate_limit` (when a rate is configured) charges the request to
+   its caller's bucket, or rejects with 429.
+3. On `GET /v1/responses/{response_id}` only, `auth::api_key::require_api_key` (OIDC
+   off, `OPENAI_API_KEY` set).
+4. The handler.
+
+Authentication must come first because the limiter keys a bucket by the verified
+principal whenever there is one. With OIDC, an unauthenticated request is rejected
+before it can consume any caller's allowance.
+
+`/health`, `/ready`, and the OpenAPI docs are public routes outside both layers. The
+outermost `track_request` layer still records 401 and 429 responses in HTTP metrics.
+
+### `rate_limit.rs`
+
+Opt-in, per-process, in-memory rate limiting with one bucket per caller.
+
+- **Algorithm.** `RateLimiter` implements GCRA, which is equivalent to a token bucket.
+  Each bucket is a single theoretical arrival time in a `Mutex`-guarded map
+  (`LimiterState::arrivals`). The critical section contains no `.await`.
+- **Keys.** `RateLimitKey::for_caller` uses the OIDC principal (`issuer` + `subject`)
+  when there is one. Otherwise it uses the connection's peer address from
+  `ConnectInfo`, with IPv6 grouped by /64. That address is why `server.rs` serves with
+  connect info.
+- **What never chooses a bucket.** A bearer token or `x-api-key` the gateway does not
+  verify, and forwarded-for headers. A client could vary them on every request.
+- **Memory bound.** The key map holds at most `MAX_KEYS` callers. When it is full, idle
+  buckets are swept at most once per `SWEEP_INTERVAL`. Callers beyond the cap share the
+  `Overflow` bucket, which keeps memory bounded under key churn.
+- **Rejections.** A rejection carries `retry-after`, `retry-after-ms`, and
+  `x-ratelimit-*-requests` hints, all rounded up.
+- **WebSocket.** The middleware charges the upgrade request. It also inserts a
+  `RateLimitCharge` extension, which the Responses WebSocket handler uses to charge each
+  `response.create` frame to the same bucket. A rejected frame is answered with an
+  error event, and the connection stays open.
+
+### `error_response.rs`
+
+The single builder for errors the gateway raises itself rather than an upstream or the
+executor: authentication failures (`auth.rs`) and rate limits (`rate_limit.rs`).
+`GatewayError` carries the status, the OpenAI and Anthropic `error.type` values, and a
+message. `ErrorFormat::for_path` picks the envelope: Messages routes answer in the
+Anthropic format, with a generated `request_id` repeated in the `request-id` header;
+every other route answers in the OpenAI format. Both envelopes are typed `Serialize`
+structs, not ad hoc JSON. Callers add their own headers, such as `WWW-Authenticate` or
+the retry hints. Executor errors keep going through `handler/common.rs`.
 
 ### The hard boundary: no direct storage access
 
@@ -596,6 +682,9 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   `InOutItem::into_input_items` uses the existing output-to-input conversion and
   client-tool lowering for model history. Storage row markers and legacy decoding
   remain in `storage/`; there is no separate conversation-item enum.
+  Item retrieval and listing return `InOutItem` directly. `into_public` assigns the
+  storage identity and expands shorthand messages on the returned item;
+  serialization uses the item types themselves, without an item-response wrapper.
   `ResponsesInput::input_items` uses `InOutItem::as_input` to borrow submitted input
   items and project outputs. The existing compaction-window selection accepts these
   borrowed items, so estimation avoids copying message and image payloads and model
@@ -867,7 +956,7 @@ all persisted data comes from the enriched copy. Use the field-specific rules be
 | Append the current client's input to restored history | Read `original_request.input`; write the combined history to `enriched_request.input` | The original input contains this request's submission; the enriched input contains the model context. |
 | Append tool calls/results, prepare reasoning, estimate context size, or compact model input | `enriched_request.input` | These operations affect the next inference round. Use the existing history/compaction helpers so canonical persistence state is updated consistently too. |
 | Build the model request | `enriched_request.to_upstream_request(stream)` | The model needs resolved history, tools, and the current round's selector. Converting the original copy would omit inherited history and tool results. |
-| Decide storage policy and route persistence | `original_request.store` and `original_request.conversation`, together with `ctx.continuation` | `should_persist` handles session and conversation exceptions to `store: false`. Use that helper rather than checking either request's `store` field alone. |
+| Decide storage policy and route persistence | `original_request.store` and `original_request.conversation`, together with `ctx.continuation` | `should_persist` allows connection-local checkpoints for response-scoped sessions; explicit conversations honor `store: false`. Use that helper rather than checking either request's `store` field alone. |
 | Identify the parent response publicly or in stored metadata | `original_request.previous_response_id` | Rehydration clears the enriched copy's parent ID after inlining its history. The public response still identifies its parent. Generated response/conversation IDs come from `RequestContext`. |
 | Populate ordinary request-derived response fields | `original_request` through `StandardResponseFields::apply_request` and `RequestContext::inject_ids` | This covers fields such as `store`, `metadata`, `text`, and `max_output_tokens`; use the existing field-specific defaulting. Upstream-derived fields such as usage and the delivered `service_tier` come from execution results. |
 | Populate public response `tools` | Active `ToolSearchState::public_response_tools()`, otherwise `enriched_request.tools`, through response metadata sanitization | Use effective public declarations, including inherited tools. Remove private MCP discovery/auth fields. The original list can be absent; the upstream list contains lowered function schemas. |
@@ -1872,6 +1961,7 @@ router, reusing the same core logic in-process.
 | Task | Where |
 |---|---|
 | Add a new HTTP or WebSocket route | `agentic-server/src/handler/{http,websocket}/`, wire it in `app.rs`'s `build_router_with_auth` |
+| Change request admission (authentication, rate limits, or gateway-raised errors) | The layer order in `app.rs`'s `build_router_with_auth`, then `auth.rs`, `rate_limit.rs`, or `error_response.rs`; startup settings in `server_settings.rs` |
 | Support a new upstream SSE event | `events/types.rs` → `events/normalize.rs` → `executor/accumulator/` → `executor/translate/` when the event needs public tool-shape translation |
 | Add a new tool type | `tool/handler.rs` impl(s) → `tool/declaration.rs` (a `ToolDeclaration` kind and its view) → `tool/normalize.rs` → `tool/registry.rs` → `executor/translate/client.rs` for client-executed function shapes → `tool/executors.rs` for lazy gateway setup |
 | Change gateway-round concurrency or lifecycle ordering | `executor/gateway.rs` (`GatewayScheduler`/event plans) + `executor/engine.rs` (round decision/ordered streaming) + `tool/ownership.rs` (typed binding and same-tool safety) |
