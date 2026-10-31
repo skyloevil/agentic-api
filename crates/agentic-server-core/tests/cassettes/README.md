@@ -441,7 +441,8 @@ printf 'Fetch http://127.0.0.1:18080/page/release-notes.html with web_fetch and 
 The streaming cassette is the same command with `--stream`. The replay binds an ephemeral port, serves the recorded
 responses with the origin re-based onto it (the streaming `tool_use` input is re-emitted as one `input_json_delta`,
 since the recorded chunks split the URL), and compares the loop's complete upstream requests with the recording,
-normalizing only the origin and `retrieved_at`.
+normalizing only the origin and `retrieved_at`. It then sends the `server_tool_use` and `web_fetch_tool_result`
+blocks the client received back in a follow-up request and checks that the gateway restores the live rounds exactly.
 
 ## Modes
 

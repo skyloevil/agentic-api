@@ -734,8 +734,32 @@ owns, such as Claude's native web search and web fetch server tools (the
 basic `web_search_20250305` and `web_fetch_20250910`, and their later versions
 when `allowed_callers` includes `"direct"`), the gateway runs
 the tool loop itself: it executes each gateway call, appends the result, and
-streams only the client-visible content. Every upstream round must be a
+returns the content of every round. Every upstream round must be a
 complete, well-formed Messages stream; a truncated or malformed round ends the
 response with an Anthropic `api_error` event before any gateway tool runs.
 Messages requests are not persisted. See
 [Claude Code integration](../design/claude-code-integration.md).
+
+Each native web search or web fetch call the gateway runs reaches the client as
+Anthropic returns it: a `server_tool_use` block, whose id is `srvtoolu_gw_`
+followed by the upstream `tool_use` id, then the matching
+`web_search_tool_result` or `web_fetch_tool_result` after the round's other
+blocks. The `server_tool_use` input is the call as the model made it, in the
+gateway's search schema (`query`, or `queries` for a batch). `usage.server_tool_use`
+counts the searches (one per query) and fetches that ran. A call through an
+operator alias, a plain function named `web_search`, or a call in a round the
+gateway does not run, such as one beside a client tool call, stays hidden.
+
+Send these blocks back unchanged. The gateway turns them into the
+`tool_use` / `tool_result` rounds the upstream saw, with the same ids and the
+same result text, on `/v1/messages` (with or without a gateway tool) and on
+`/v1/messages/count_tokens`. A search result's page text is sealed in its
+`encrypted_content`; search content that was altered or not sealed by the
+gateway, and a gateway block that is unpaired or repeated, are refused with
+HTTP 400 `invalid_request_error`. A fetched page is not sealed and replays as
+sent. A round that also ran a hidden call replays without it, since the client
+never saw that call. Search results sealed under
+another key, such as by a process without `AGENTIC_MESSAGES_RESULT_KEY` before
+a restart, reach the model as a note that they are no longer available. A
+`web_fetch_tool_result` also carries the page's `content_type` and `truncated`
+flag, and a refusal its `message`, so the model reads the same text again.

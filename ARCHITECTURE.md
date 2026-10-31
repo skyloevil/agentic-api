@@ -1690,8 +1690,8 @@ which only a native declaration does, so a client function that happens to be na
 counted in fetches; every admitted call is charged whatever its outcome, and a call whose
 arguments carry no URL is not. Two rules live in the loop rather than the handler because
 only the loop holds the conversation: the budget, and the Anthropic rule that a URL must
-already appear in a user message or a `tool_result` (including hidden `web_search`
-results) before it can be fetched. The handler owns everything else — URL admission, the
+already appear in a user message or a `tool_result` (including gateway `web_search`
+and `web_fetch` results) before it can be fetched. The handler owns everything else — URL admission, the
 address policy and DNS pinning applied to every redirect hop, domain filtering,
 HTML-to-text extraction, the content limit, and the `max_concurrent_gateway_calls`
 ceiling on fetches in flight — and answers documented failures in the
@@ -1756,13 +1756,47 @@ call is never executed. `messages_loop.rs`'s `deliver` strips gateway-owned `too
 blocks from the returned message, matching the streaming accumulator, which suppresses them
 on every round. The assistant turn fed back to the model still carries the call.
 
+A call to a native server tool is shown rather than hidden (`messages_server_tools.rs`,
+#409). When the client declared Anthropic's native `web_search` or `web_fetch`, each
+call the gateway executes reaches the client as a `server_tool_use` block (id
+`srvtoolu_gw_` plus the upstream `tool_use` id) and, after the round's other blocks, its
+`web_search_tool_result` or `web_fetch_tool_result`. A call through an operator alias, a
+plain function named `web_search`, and any call in a round the gateway does not run stay
+hidden. `execute_gateway_calls` builds each native call's typed result block with its
+`tool_result`, so JSON and SSE serialize one projection: the JSON loop returns the content
+of every round, and the streaming accumulator holds the rest of a round once a native call
+starts, releasing it in order at the round's end — the native calls as `server_tool_use`
+blocks before they execute, or hidden when the round does not run them — then streams the
+result blocks after execution.
+
+The result block is the record of a call: the model's `tool_result` text is projected from
+it on the live round and again on replay, so a returned turn reproduces the original rounds
+exactly. `replay::replay_server_tool_blocks` runs at the start of both loops, in
+`count_tokens`, and on the proxy path when a body carries a gateway id; it splits each
+assistant message at the end of every run of result blocks into the round's `tool_use`
+blocks and a user message of `tool_result`s, and refuses with HTTP 400 a gateway block that
+is unpaired or repeated, or search content that does not open under the key. Replay is exact
+for every round whose gateway calls were all shown. A hidden call leaves no block, so a round
+that also ran one replays without it, and a round whose calls were all hidden leaves only its
+other blocks, which join the next round; a fetch result carries its page text in the clear and
+replays as sent. A search result carries the executor's result data sealed in
+`encrypted_content` (`sealing.rs`: AES-256-GCM under a content key drawn per envelope by
+HKDF from `AGENTIC_MESSAGES_RESULT_KEY`, or from a secret generated once per process; the
+associated data binds the upstream id, the call's queries, and the result's position).
+Results sealed under another key replay as a fixed note rather than failing the
+conversation. A failed search shows its documented code, with the executor's detail
+logged; a fetch result also carries the content type, truncation flag, and refusal message
+the model read.
+
 Each round's `usage` is folded into `messages_usage.rs`'s `MessagesUsageTotals`, so when
 hidden gateway rounds ran, the returned message (JSON) and the terminal `message_delta` (SSE)
 report the saturating sum of the Anthropic token counters across every round rather than the
 final round alone. A streamed round counts its `message_start.usage` overlaid by its
 `message_delta.usage`. Counters no round reported stay absent, the remaining `usage` fields
 pass through from the final round, a single-round turn is returned unchanged, and a final
-round that omits `usage` still reports the hidden rounds' counters.
+round that omits `usage` still reports the hidden rounds' counters. `usage.server_tool_use`
+adds the gateway's successful native searches (one per query) and fetches to the counters
+the upstream reported.
 
 ### `storage/` — persistence
 

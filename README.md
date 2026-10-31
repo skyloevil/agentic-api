@@ -718,10 +718,23 @@ version defines, or `response_inclusion` on a version before `web_search_2026031
 several queries into one call, and every query counts as one search. A call that the remaining budget cannot cover is
 not run, and the model is told the limit was reached; a later call that fits still runs.
 
+Each search the gateway runs is returned the way Anthropic returns it: a `server_tool_use` block with the model's
+query, then a `web_search_tool_result` listing each result's URL, title, and page age, and
+`usage.server_tool_use.web_search_requests` counts the searches that ran. Claude Code builds its result list and search
+count from these blocks. The page text travels in each result's `encrypted_content`, which the gateway seals; send the
+blocks back unchanged, and the next turn gives the model the same results it read before without searching again.
+Altered `encrypted_content` is refused with HTTP 400, as Anthropic refuses it. A failed search shows its documented
+error code. The `server_tool_use` input is the call as the model made it, in the gateway's search schema (`query`, or
+`queries` for a batch).
+Results stay readable across restarts and on every replica that shares `AGENTIC_MESSAGES_RESULT_KEY`, a secret of at
+least 32 random bytes; without it, each process generates its own key, and results sealed by another process reach
+the model as a note that they are no longer available.
+
 Older clients that declare a function tool named `WebSearch` can still opt in with
 `MESSAGES_GATEWAY_TOOL_ALIASES="WebSearch=web_search"`. This variable maps a client tool name to a gateway executor
 (`name=executor`, comma-separated) and remains empty by default. The gateway adapts the older `WebSearch` function's
-`allowed_domains`/`blocked_domains` arguments to the executor's schema automatically.
+`allowed_domains`/`blocked_domains` arguments to the executor's schema automatically. A call through an alias is the
+client's own function, so it stays hidden from the client, as does a plain function named `web_search`.
 
 > Note: allow and block domain lists are mutually exclusive, matching Anthropic's native tool contract.
 
@@ -730,9 +743,10 @@ Older clients that declare a function tool named `WebSearch` can still opt in wi
 Applications that call the Messages API through the Anthropic SDK can declare Claude's native
 [`web_fetch`](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool) server tool, in its basic
 version `web_fetch_20250910` or a later one. Agentic API rewrites that declaration into an ordinary function tool for
-the upstream model, fetches the page itself when the model calls it, hands the page text back to the model, and keeps
-the call out of the client-visible response: the same hide-the-call contract as web search. `/v1/messages/count_tokens`
-accepts the declaration too. No search provider or API key is involved; the built-in fetcher is on by default and can be
+the upstream model, fetches the page itself when the model calls it, hands the page text back to the model, and
+returns the call to the client as a `server_tool_use` block and a `web_fetch_tool_result` with the page text, as
+Anthropic does, counted in `usage.server_tool_use.web_fetch_requests`. `/v1/messages/count_tokens` accepts the
+declaration too. No search provider or API key is involved; the built-in fetcher is on by default and can be
 switched off with `[web_fetch] enabled = false` or `AGENTIC_WEB_FETCH_ENABLED=false`, after which such a declaration is
 rejected with HTTP 400 instead of being forwarded in a shape the upstream cannot execute.
 
@@ -762,7 +776,9 @@ budget of four bytes per token, and the text is always cut below the gateway's 1
 cannot be served answers the model with the documented
 [error codes](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool#errors) in an error
 `tool_result` (`url_not_accessible`, `url_not_allowed`, `too_many_requests`, `unsupported_content_type`, `url_too_long`,
-`invalid_tool_input`, `max_uses_exceeded`, `url_not_in_prior_context`, `unavailable`), so the turn continues.
+`invalid_tool_input`, `max_uses_exceeded`, `url_not_in_prior_context`, `unavailable`), so the turn continues. The
+`web_fetch_tool_result` carries what the model read: beyond Anthropic's fields, the content type and truncation flag
+of a page, and the message of a refusal. Sent back in a later turn, it gives the model the same text again.
 
 Fetches are bounded and never reach internal networks:
 
@@ -792,8 +808,7 @@ Fetches are bounded and never reach internal networks:
 | Time ceiling | `AGENTIC_WEB_FETCH_TIMEOUT_SECS` | `[web_fetch] timeout_secs` | `20` |
 
 Claude Code is unaffected: its `WebFetch` is a client tool with its own schema that Claude Code runs locally, and a
-client function named `web_fetch` without the native `type` stays client-owned. Page content reaches the client only
-through the model's answer; returning `server_tool_use` blocks to the client (#409) and PDF text are follow-ups.
+client function named `web_fetch` without the native `type` stays client-owned. PDF text is a follow-up.
 
 ## 🧩 Tool Ownership Model
 
